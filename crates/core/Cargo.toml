@@ -16,6 +16,7 @@ directories.workspace = true
 tree-sitter.workspace = true
 tree-sitter-php.workspace = true
 streaming-iterator.workspace = true
+notify.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

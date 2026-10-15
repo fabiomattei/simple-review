@@ -1,6 +1,6 @@
 //! Lazily loaded commit list.
 
-use egui::{Align2, FontId, Rect, Sense, TextStyle, Ui, pos2, vec2};
+use egui::{Align2, FontId, Rect, RichText, Sense, TextStyle, Ui, pos2, vec2};
 use review_core::git::format_time;
 
 use super::{Action, palette};
@@ -23,6 +23,17 @@ pub fn show(ui: &mut Ui, rs: &mut RepoState, actions: &mut Vec<Action>) {
         });
     });
     ui.separator();
+    if let Some(range) = &rs.range {
+        let whole = rs.commit.as_ref().is_some_and(|c| c.base.is_some());
+        if ui
+            .selectable_label(whole, RichText::new(format!("▶ Whole range {}", range.label)).strong())
+            .on_hover_text("Review all changes in the range at once")
+            .clicked()
+        {
+            actions.push(Action::SelectWholeRange);
+        }
+        ui.separator();
+    }
 
     let pal = palette(ui);
     let selected = rs.commit.as_ref().map(|c| c.info.id);
@@ -44,7 +55,7 @@ pub fn show(ui: &mut Ui, rs: &mut RepoState, actions: &mut Vec<Action>) {
             let idx = rs.visible[vi];
             let c = &rs.commits[idx];
             let (rect, response) = ui.allocate_exact_size(vec2(ui.available_width(), ROW_H), Sense::click());
-            let is_selected = selected == Some(c.id);
+            let is_selected = selected == Some(c.id) && rs.commit.as_ref().is_some_and(|sc| sc.base.is_none());
             if is_selected {
                 ui.painter().rect_filled(rect, 3.0, ui.visuals().selection.bg_fill);
             } else if response.hovered() {

@@ -11,6 +11,7 @@ crossbeam-channel.workspace = true
 eframe.workspace = true
 egui.workspace = true
 rfd.workspace = true
+pulldown-cmark = { version = "0.13", default-features = false }
 
 [dev-dependencies]
 egui_kittest = { version = "0.36", features = ["wgpu", "snapshot", "eframe"] }

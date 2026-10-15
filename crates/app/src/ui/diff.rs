@@ -34,6 +34,20 @@ pub struct DiffInput<'a> {
     /// `Some` when the blame gutter is shown; a side's blame may still be loading.
     pub blame: Option<BlameInput<'a>>,
     pub cursor: Option<Cursor>,
+    /// Lines selected for commenting.
+    pub selection: Option<(Side, u32, u32)>,
+    pub threads: &'a [ThreadMark],
+}
+
+/// A comment thread shown in the gutter.
+#[derive(Debug, Clone)]
+pub struct ThreadMark {
+    pub thread_id: i64,
+    pub side: Side,
+    pub start: u32,
+    pub end: u32,
+    pub comments: usize,
+    pub open: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -106,6 +120,11 @@ impl Pane {
             x += m.marker_w();
         }
         Pane { rect, blame_x, numbers, marker_x, text_x: x }
+    }
+
+    /// Where comment markers go: the change-marker column, or the start of the numbers.
+    fn mark_x(&self, m: &Metrics) -> f32 {
+        if self.text_x > self.marker_x { self.marker_x } else { self.blame_x + m.blame_w() }
     }
 
     fn text_rect(&self, row: Rect) -> Rect {
@@ -200,7 +219,7 @@ pub fn show(
                 let width = ui.max_rect().width();
                 let rows_rect = Rect::from_min_size(origin, vec2(width, content_h));
                 let panes = panes(&m, rows_rect, input);
-                let response = ui.interact(rows_rect, ui.id().with("rows"), Sense::click());
+                let response = ui.interact(rows_rect, ui.id().with("rows"), Sense::click_and_drag());
                 handle_pointer(ui, &response, &m, &panes, input, origin, row_h, *h_scroll, actions);
 
                 let first = (viewport.min.y / row_h).floor().max(0.0) as usize;
@@ -235,6 +254,7 @@ pub fn show(
 /// What is under the pointer.
 enum Hit<'a> {
     Text { cursor: Cursor },
+    Thread { id: i64 },
     Blame { commit: &'a BlameCommit },
     Other,
 }
@@ -267,14 +287,21 @@ fn hit_test<'a>(
             None => (Some(row_idx), Hit::Other),
         };
     }
-    if pos.x >= pane.text_x {
-        let lines = if side == Side::Old { input.old } else { input.new };
-        let text = lines.get(cell.line as usize).map_or("", String::as_str);
-        let display_col = ((pos.x - pane.text_x + h_scroll) / m.char_w).floor().max(0.0) as usize;
-        let col = byte_at_display_col(text, display_col) as u32;
-        return (Some(row_idx), Hit::Text { cursor: Cursor { side, line: cell.line, col } });
+    let mark_x = pane.mark_x(m);
+    if (mark_x..mark_x + m.marker_w()).contains(&pos.x)
+        && let Some(t) = input.threads.iter().find(|t| t.side == side && t.start == cell.line)
+    {
+        return (Some(row_idx), Hit::Thread { id: t.thread_id });
     }
-    (Some(row_idx), Hit::Other)
+    if pos.x < pane.text_x {
+        // Line numbers: select whole lines.
+        return (Some(row_idx), Hit::Text { cursor: Cursor { side, line: cell.line, col: 0 } });
+    }
+    let lines = if side == Side::Old { input.old } else { input.new };
+    let text = lines.get(cell.line as usize).map_or("", String::as_str);
+    let display_col = ((pos.x - pane.text_x + h_scroll) / m.char_w).floor().max(0.0) as usize;
+    let col = byte_at_display_col(text, display_col) as u32;
+    (Some(row_idx), Hit::Text { cursor: Cursor { side, line: cell.line, col } })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -297,8 +324,25 @@ fn handle_pointer(
                 response.clone().on_hover_ui_at_pointer(|ui| blame_tooltip(ui, commit));
             }
             Hit::Text { .. } if command => ui.ctx().set_cursor_icon(CursorIcon::PointingHand),
+            Hit::Thread { .. } => {
+                ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+                response.clone().on_hover_text_at_pointer("Show comments");
+            }
             _ => {}
         }
+    }
+    let shift = ui.input(|i| i.modifiers.shift);
+    if response.drag_started()
+        && let Some(pos) = ui.input(|i| i.pointer.press_origin())
+        && let (_, Hit::Text { cursor }) = hit_test(pos, m, panes, input, origin, row_h, h_scroll)
+    {
+        actions.push(Action::SetCursor(cursor));
+    }
+    if response.dragged()
+        && let Some(pos) = response.interact_pointer_pos()
+        && let (_, Hit::Text { cursor }) = hit_test(pos, m, panes, input, origin, row_h, h_scroll)
+    {
+        actions.push(Action::SelectTo(cursor));
     }
     if response.clicked()
         && let Some(pos) = response.interact_pointer_pos()
@@ -308,6 +352,8 @@ fn handle_pointer(
             actions.push(Action::ClickRow(row));
         }
         match hit {
+            Hit::Text { cursor } if shift => actions.push(Action::SelectTo(cursor)),
+            Hit::Thread { id } => actions.push(Action::GoToThread(id)),
             Hit::Text { cursor } => {
                 actions.push(Action::SetCursor(cursor));
                 if command {
@@ -420,6 +466,9 @@ fn paint_cell(
     if input.cursor.is_some_and(|c| c.side == side && c.line == cell.line) {
         painter.rect_filled(rect, 0.0, pal.cursor_line);
     }
+    if input.selection.is_some_and(|(s, a, b)| s == side && (a..=b).contains(&cell.line)) {
+        painter.rect_filled(rect, 0.0, pal.selection);
+    }
     let y = rect.center().y;
 
     if let Some(blame) = input.blame {
@@ -443,11 +492,28 @@ fn paint_cell(
     if !input.single {
         painter.text(pos2(pane.marker_x + 2.0, y), Align2::LEFT_CENTER, marker(cell.kind, side), m.font.clone(), pal.weak);
     }
+    paint_thread_marks(painter, m, pal, pane, rect, cell.line, side, input.threads);
     let (lines, hl) = match side {
         Side::Old => (input.old, input.hl_old),
         Side::New => (input.new, input.hl_new),
     };
     paint_text(painter, m, pal, pane.text_rect(rect), cell, lines, hl, h_scroll);
+}
+
+/// A count badge on a thread's first line and a bar along its lines.
+#[allow(clippy::too_many_arguments)]
+fn paint_thread_marks(painter: &egui::Painter, m: &Metrics, pal: &Palette, pane: &Pane, rect: Rect, line: u32, side: Side, threads: &[ThreadMark]) {
+    let x = pane.mark_x(m);
+    for t in threads.iter().filter(|t| t.side == side && (t.start..=t.end).contains(&line)) {
+        let colour = if t.open { pal.accent } else { pal.weak };
+        painter.rect_filled(Rect::from_min_size(pos2(pane.text_x - 3.0, rect.min.y), vec2(2.0, rect.height())), 0.0, colour);
+        if line == t.start {
+            let badge = Rect::from_min_size(pos2(x + 1.0, rect.min.y + 1.0), vec2(m.marker_w() - 2.0, rect.height() - 2.0));
+            painter.rect_filled(badge, 3.0, colour);
+            let label = if t.comments > 9 { "+".to_string() } else { t.comments.to_string() };
+            painter.text(badge.center(), Align2::CENTER_CENTER, label, m.font.clone(), Color32::WHITE);
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]

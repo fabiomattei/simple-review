@@ -19,6 +19,9 @@ pub struct ToolbarState<'a> {
     pub unified: bool,
     pub blame_on: bool,
     pub blame_by_committer: bool,
+    /// Label of the range under review, if any.
+    pub range: Option<String>,
+    pub open_comments: usize,
 }
 
 pub fn toolbar(ui: &mut Ui, s: &ToolbarState<'_>, actions: &mut Vec<Action>) {
@@ -42,6 +45,32 @@ pub fn toolbar(ui: &mut Ui, s: &ToolbarState<'_>, actions: &mut Vec<Action>) {
             ui.strong(name);
             if ui.small_button("⟳").on_hover_text("Reload commits (F5)").clicked() {
                 actions.push(Action::Reload);
+            }
+            if ui.button("Compare…").on_hover_text("Review a range: branch vs base, A...B, A..B").clicked() {
+                actions.push(Action::OpenCompare);
+            }
+            if let Some(range) = &s.range {
+                ui.label(RichText::new(format!("Range {range}")).color(palette(ui).accent));
+                if ui.small_button("×").on_hover_text("Leave range review").clicked() {
+                    actions.push(Action::ExitRange);
+                }
+            }
+            ui.menu_button(format!("Export ({})", s.open_comments), |ui| {
+                if ui.button("Write feedback file for Claude Code").on_hover_text("Open comments as instructions, in the repository (see Settings)").clicked() {
+                    actions.push(Action::WriteFeedback);
+                    ui.close();
+                }
+                if ui.button("Copy open comments as prompt").clicked() {
+                    actions.push(Action::CopyFeedback);
+                    ui.close();
+                }
+                if ui.button("Save review report…").clicked() {
+                    actions.push(Action::SaveReport);
+                    ui.close();
+                }
+            });
+            if ui.button("Settings").clicked() {
+                actions.push(Action::OpenSettings);
             }
         }
         ui.separator();
@@ -86,9 +115,17 @@ pub fn toolbar(ui: &mut Ui, s: &ToolbarState<'_>, actions: &mut Vec<Action>) {
     });
 }
 
-pub fn commit_details(ui: &mut Ui, sc: &SelectedCommit, actions: &mut Vec<Action>) {
+pub fn commit_details(ui: &mut Ui, sc: &SelectedCommit, range: Option<&str>, actions: &mut Vec<Action>) {
     let pal = palette(ui);
     let c = &sc.info;
+    if let (Some(base), Some(range)) = (sc.base, range) {
+        ui.label(RichText::new(format!("Range {range}")).strong().size(16.0));
+        ui.horizontal_wrapped(|ui| {
+            ui.monospace(format!("{}..{}", base.to_hex_with_len(8), c.short_id()));
+            ui.weak(format!("tip: {} — {}", c.summary, c.author.name));
+        });
+        return;
+    }
     ui.horizontal_wrapped(|ui| {
         ui.label(RichText::new(&c.summary).strong().size(16.0));
         if c.ai_assisted {

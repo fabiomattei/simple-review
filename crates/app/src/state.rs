@@ -10,6 +10,9 @@ use review_core::file_view::FileView;
 use review_core::blame::Blame;
 use review_core::git::{ChangeStatus, CommitInfo, FileChange, FileSide, Repo, TreeFile};
 use review_core::highlight::{Highlighted, ThemeKind};
+use review_core::range::CommitRange;
+use review_core::review::{Placement, Thread, ThreadStatus};
+use review_core::watch::RepoWatcher;
 use review_core::settings::RepoSettings;
 use review_core::symbols::{Located, Lookup, RefHit, SymbolIndex};
 use review_core::tasks::{CancelToken, CommitPager};
@@ -84,6 +87,13 @@ pub enum JobResult {
         commit: ObjectId,
         result: Result<Vec<TreeFile>, String>,
     },
+    /// An export finished: a message for the user, or an error.
+    Exported(Result<ExportDone, String>),
+}
+
+pub enum ExportDone {
+    Written(String),
+    Copied { text: String, count: usize },
 }
 
 pub struct RepoState {
@@ -100,6 +110,17 @@ pub struct RepoState {
     pub history: History,
     /// Scroll the commit list so the selected commit is visible.
     pub reveal_commit: bool,
+    /// The tip the commit list was loaded from, to notice new commits.
+    pub head: Option<ObjectId>,
+    /// When set, the list shows only `range.base..range.tip` and the whole range can be reviewed.
+    pub range: Option<CommitRange>,
+    pub watcher: Option<RepoWatcher>,
+    /// `user.name` / `user.email` for new comments.
+    pub identity: (String, String),
+    /// All comment threads of the repository.
+    pub threads: Vec<Thread>,
+    /// Bumped whenever `threads` is reloaded, so cached placements can be refreshed.
+    pub threads_generation: u64,
 }
 
 impl RepoState {
@@ -129,7 +150,12 @@ pub enum HunkTarget {
 }
 
 pub struct SelectedCommit {
+    /// The commit, or the range tip when reviewing a whole range.
     pub info: CommitInfo,
+    /// Range base: when set, the diff is `base..info` instead of against a parent.
+    pub base: Option<ObjectId>,
+    /// Committer time of the old side's commit, for ordering comment versions.
+    pub base_time: i64,
     pub parent_idx: usize,
     pub files: FilesState,
     pub reviewed: HashSet<String>,
@@ -147,7 +173,15 @@ pub struct SelectedCommit {
 
 impl SelectedCommit {
     pub fn parent(&self) -> Option<ObjectId> {
-        self.info.parents.get(self.parent_idx).copied()
+        self.base.or_else(|| self.info.parents.get(self.parent_idx).copied())
+    }
+
+    /// Key under which per-file review marks are stored: the commit, or the range.
+    pub fn review_key(&self) -> String {
+        match self.base {
+            Some(base) => format!("{base}..{}", self.info.id),
+            None => self.info.id.to_string(),
+        }
     }
 
     pub fn files(&self) -> &[FileChange] {
@@ -197,6 +231,10 @@ pub struct SelectedFile {
     pub h_scroll: f32,
     pub target: HunkTarget,
     pub cursor: Option<Cursor>,
+    /// Lines selected for a comment: side and inclusive line range.
+    pub selection: Option<(Side, u32, u32)>,
+    /// Comment threads placed on this view; recomputed when threads or the view change.
+    pub placed: Option<(u64, Vec<PlacedThread>)>,
     /// Line to reveal once the view is ready.
     pub pending_line: Option<(Side, u32)>,
 }
@@ -230,6 +268,8 @@ impl SelectedFile {
             h_scroll: 0.0,
             target,
             cursor: None,
+            selection: None,
+            placed: None,
             pending_line: None,
         }
     }
@@ -311,6 +351,7 @@ pub enum PeekTab {
     Definition,
     References,
     Blame,
+    Comments,
 }
 
 /// A version of the code: the commit whose tree a lookup runs against.
@@ -359,10 +400,95 @@ pub struct Peek {
     pub tab: PeekTab,
     pub definition: Option<DefinitionPeek>,
     pub references: Option<ReferencesPeek>,
+    pub comment_scope: CommentScope,
+    pub status_filter: StatusFilter,
+    /// Thread to highlight and scroll to in the Comments tab.
+    pub focused_thread: Option<i64>,
+    /// Scroll the Comments tab to `focused_thread` on the next frame.
+    pub reveal_thread: bool,
 }
 
 impl Default for Peek {
     fn default() -> Self {
-        Peek { open: false, tab: PeekTab::Definition, definition: None, references: None }
+        Peek {
+            open: false,
+            tab: PeekTab::Definition,
+            definition: None,
+            references: None,
+            comment_scope: CommentScope::File,
+            status_filter: StatusFilter::Open,
+            focused_thread: None,
+            reveal_thread: false,
+        }
     }
+}
+
+/// A thread shown on the current file view.
+#[derive(Debug, Clone)]
+pub struct PlacedThread {
+    pub thread_id: i64,
+    pub side: Side,
+    pub placement: Placement,
+}
+
+impl PlacedThread {
+    pub fn lines(&self) -> Option<(u32, u32)> {
+        self.placement.lines()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommentScope {
+    File,
+    Commit,
+    All,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StatusFilter {
+    Open,
+    Closed,
+    All,
+}
+
+impl StatusFilter {
+    pub fn matches(self, status: ThreadStatus) -> bool {
+        match self {
+            StatusFilter::Open => status == ThreadStatus::Open,
+            StatusFilter::Closed => status != ThreadStatus::Open,
+            StatusFilter::All => true,
+        }
+    }
+}
+
+/// What the comment editor will do on save.
+#[derive(Debug, Clone, PartialEq)]
+pub enum EditorTarget {
+    NewThread { side: Side, start: u32, end: u32 },
+    Reply(i64),
+    Edit(i64),
+}
+
+pub struct CommentEditor {
+    pub target: EditorTarget,
+    /// Where the comment goes, for the editor's title.
+    pub context: String,
+    pub text: String,
+    pub preview: bool,
+    pub error: Option<String>,
+}
+
+pub struct CompareDialog {
+    pub spec: String,
+    pub refs: Vec<String>,
+    pub base_branch: Option<String>,
+    pub current_branch: Option<String>,
+    pub error: Option<String>,
+}
+
+pub struct SettingsDialog {
+    pub base_branch: String,
+    pub ignored_paths: String,
+    pub feedback_path: String,
+    pub live_refresh: bool,
 }

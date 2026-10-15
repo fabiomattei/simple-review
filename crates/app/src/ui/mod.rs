@@ -1,10 +1,13 @@
 //! Widgets. They read state and report what the user did as [`Action`]s; the app applies them.
 
+pub mod comments;
 pub mod commits;
+pub mod dialogs;
 pub mod diff;
 pub mod files;
 pub mod header;
 pub mod help;
+pub mod markdown;
 pub mod peek;
 
 use std::path::PathBuf;
@@ -13,11 +16,36 @@ use egui::Color32;
 use review_core::ObjectId;
 use review_core::git::ChangeStatus;
 
-use crate::state::{Cursor, PeekTab};
+use review_core::review::ThreadStatus;
+
+use crate::state::{CommentScope, Cursor, PeekTab, StatusFilter};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Action {
     SetCursor(Cursor),
+    /// Extend the line selection from the cursor to here (drag or Shift+click).
+    SelectTo(Cursor),
+    StartComment,
+    SaveComment,
+    ReplyTo(i64),
+    EditComment(i64),
+    DeleteComment(i64),
+    SetThreadStatus(i64, ThreadStatus),
+    GoToThread(i64),
+    NextThread,
+    PrevThread,
+    CommentScope(CommentScope),
+    CommentStatusFilter(StatusFilter),
+    WriteFeedback,
+    CopyFeedback,
+    SaveReport,
+    OpenCompare,
+    CompareRange(String),
+    ExitRange,
+    SelectWholeRange,
+    OpenSettings,
+    SaveSettings,
+    CloseDialogs,
     GoToDefinition,
     FindReferences,
     OpenCommit { id: ObjectId, path: Option<String> },
@@ -71,6 +99,7 @@ pub struct Palette {
     pub ai: Color32,
     pub warn: Color32,
     pub cursor_line: Color32,
+    pub selection: Color32,
     pub dark: bool,
 }
 
@@ -90,6 +119,7 @@ impl Palette {
                 ai: Color32::from_rgb(0xb3, 0x88, 0xff),
                 warn: Color32::from_rgb(0xe5, 0xa5, 0x3c),
                 cursor_line: Color32::from_rgba_unmultiplied(0x4d, 0x9d, 0xff, 28),
+                selection: Color32::from_rgba_unmultiplied(0x4d, 0x9d, 0xff, 60),
                 dark,
             }
         } else {
@@ -106,6 +136,7 @@ impl Palette {
                 ai: Color32::from_rgb(0x82, 0x50, 0xdf),
                 warn: Color32::from_rgb(0x9a, 0x67, 0x00),
                 cursor_line: Color32::from_rgba_unmultiplied(0x09, 0x69, 0xda, 22),
+                selection: Color32::from_rgba_unmultiplied(0x09, 0x69, 0xda, 50),
                 dark,
             }
         }
@@ -134,4 +165,10 @@ pub fn human_size(bytes: u64) -> String {
         unit += 1;
     }
     if unit == 0 { format!("{bytes} B") } else { format!("{value:.1} {}", UNITS[unit]) }
+}
+
+/// A Unix timestamp in local-agnostic form (UTC), for comment headers.
+pub fn time_label(seconds: i64) -> String {
+    let sig = review_core::git::Signature { name: String::new(), email: String::new(), time: seconds, offset: 0 };
+    format!("{} UTC", review_core::git::format_time(&sig))
 }

@@ -4,6 +4,7 @@ use egui::{RichText, TextStyle, Ui};
 use review_core::blame::BlameCommit;
 
 use super::diff::{blame_tooltip, line_job};
+use super::comments::CommentsView;
 use super::{Action, palette};
 use crate::state::{DefinitionState, Peek, PeekTab, ReferencesState};
 
@@ -17,12 +18,13 @@ pub struct BlameInfo<'a> {
     pub error: Option<&'a str>,
 }
 
-pub fn show(ui: &mut Ui, peek: &Peek, blame: &BlameInfo<'_>, actions: &mut Vec<Action>) {
+pub fn show(ui: &mut Ui, peek: &Peek, blame: &BlameInfo<'_>, comments: Option<&CommentsView>, actions: &mut Vec<Action>) {
     ui.horizontal(|ui| {
         for (tab, label, hint) in [
             (PeekTab::Definition, "Definition", "F12 / Cmd+click"),
             (PeekTab::References, "References", "Shift+F12"),
             (PeekTab::Blame, "Blame", "Line history for the cursor line"),
+            (PeekTab::Comments, "Comments", "Review comments (c to add, . and , to step)"),
         ] {
             if ui.selectable_label(peek.tab == tab, label).on_hover_text(hint).clicked() {
                 actions.push(Action::PeekTab(tab));
@@ -39,6 +41,12 @@ pub fn show(ui: &mut Ui, peek: &Peek, blame: &BlameInfo<'_>, actions: &mut Vec<A
         PeekTab::Definition => definition(ui, peek, actions),
         PeekTab::References => references(ui, peek, actions),
         PeekTab::Blame => blame_tab(ui, blame, actions),
+        PeekTab::Comments => match comments {
+            Some(view) => super::comments::show(ui, view, actions),
+            None => {
+                ui.weak("Open a file to see its comments.");
+            }
+        },
     }
 }
 

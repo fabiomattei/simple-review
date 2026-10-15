@@ -1,6 +1,5 @@
 //! Settings, recent repositories and per-file review marks, stored in SQLite in the app data dir.
 
-use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -25,6 +24,10 @@ pub struct RepoSettings {
     /// Paths whose diffs are collapsed by default. `dir/` matches a directory prefix,
     /// `*.ext` matches a suffix, anything else matches a file name or full path.
     pub ignored_paths: Vec<String>,
+    /// Where "Write REVIEW_FEEDBACK.md" writes, relative to the repository root.
+    pub feedback_path: String,
+    /// Watch the repository and show new commits as they appear.
+    pub live_refresh: bool,
 }
 
 impl Default for RepoSettings {
@@ -32,6 +35,8 @@ impl Default for RepoSettings {
         RepoSettings {
             base_branch: "main".into(),
             ignored_paths: DEFAULT_IGNORED_PATHS.iter().map(|s| s.to_string()).collect(),
+            feedback_path: "REVIEW_FEEDBACK.md".into(),
+            live_refresh: true,
         }
     }
 }
@@ -58,7 +63,53 @@ pub fn path_matches(path: &str, pattern: &str) -> bool {
 }
 
 pub struct Store {
-    conn: Connection,
+    pub(crate) conn: Connection,
+}
+
+/// Schema migrations, applied in order; `PRAGMA user_version` records how many ran.
+const MIGRATIONS: &[&str] = &[
+    "CREATE TABLE IF NOT EXISTS settings (
+         scope TEXT NOT NULL, key TEXT NOT NULL, value TEXT NOT NULL,
+         PRIMARY KEY (scope, key));
+     CREATE TABLE IF NOT EXISTS recent_repos (
+         path TEXT PRIMARY KEY, opened_at INTEGER NOT NULL);
+     CREATE TABLE IF NOT EXISTS reviewed_files (
+         repo TEXT NOT NULL, commit_id TEXT NOT NULL, path TEXT NOT NULL,
+         PRIMARY KEY (repo, commit_id, path));",
+    "CREATE TABLE threads (
+         id INTEGER PRIMARY KEY,
+         repo TEXT NOT NULL,
+         commit_id TEXT NOT NULL,
+         version_id TEXT NOT NULL,
+         version_time INTEGER NOT NULL,
+         path TEXT NOT NULL,
+         side TEXT NOT NULL CHECK (side IN ('old', 'new')),
+         start_line INTEGER NOT NULL,
+         end_line INTEGER NOT NULL,
+         anchor_before TEXT NOT NULL,
+         anchor_lines TEXT NOT NULL,
+         anchor_after TEXT NOT NULL,
+         status TEXT NOT NULL CHECK (status IN ('open', 'resolved', 'wont_fix')),
+         created_at INTEGER NOT NULL,
+         updated_at INTEGER NOT NULL);
+     CREATE INDEX threads_by_path ON threads (repo, path);
+     CREATE TABLE comments (
+         id INTEGER PRIMARY KEY,
+         thread_id INTEGER NOT NULL REFERENCES threads (id) ON DELETE CASCADE,
+         author_name TEXT NOT NULL,
+         author_email TEXT NOT NULL,
+         body TEXT NOT NULL,
+         created_at INTEGER NOT NULL,
+         updated_at INTEGER NOT NULL);
+     CREATE INDEX comments_by_thread ON comments (thread_id);",
+];
+
+/// Current Unix time in seconds.
+pub fn now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or_default()
 }
 
 impl Store {
@@ -78,18 +129,15 @@ impl Store {
         Self::init(Connection::open_in_memory()?)
     }
 
-    fn init(conn: Connection) -> Result<Self> {
-        conn.execute_batch(
-            "PRAGMA journal_mode = WAL;
-             CREATE TABLE IF NOT EXISTS settings (
-                 scope TEXT NOT NULL, key TEXT NOT NULL, value TEXT NOT NULL,
-                 PRIMARY KEY (scope, key));
-             CREATE TABLE IF NOT EXISTS recent_repos (
-                 path TEXT PRIMARY KEY, opened_at INTEGER NOT NULL);
-             CREATE TABLE IF NOT EXISTS reviewed_files (
-                 repo TEXT NOT NULL, commit_id TEXT NOT NULL, path TEXT NOT NULL,
-                 PRIMARY KEY (repo, commit_id, path));",
-        )?;
+    fn init(mut conn: Connection) -> Result<Self> {
+        conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON;")?;
+        let version: usize = conn.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))? as usize;
+        for (i, sql) in MIGRATIONS.iter().enumerate().skip(version) {
+            let tx = conn.transaction()?;
+            tx.execute_batch(sql).with_context(|| format!("database migration {}", i + 1))?;
+            tx.pragma_update(None, "user_version", (i + 1) as i64)?;
+            tx.commit()?;
+        }
         Ok(Store { conn })
     }
 
@@ -129,20 +177,23 @@ impl Store {
         if let Some(v) = self.get(&scope, "ignored_paths")? {
             s.ignored_paths = v.lines().map(str::to_string).filter(|l| !l.trim().is_empty()).collect();
         }
+        if let Some(v) = self.get(&scope, "feedback_path")? {
+            s.feedback_path = v;
+        }
+        s.live_refresh = self.get_bool(&scope, "live_refresh", s.live_refresh);
         Ok(s)
     }
 
     pub fn save_repo_settings(&self, repo: &Path, s: &RepoSettings) -> Result<()> {
         let scope = repo.to_string_lossy();
         self.set(&scope, "base_branch", &s.base_branch)?;
-        self.set(&scope, "ignored_paths", &s.ignored_paths.join("\n"))
+        self.set(&scope, "ignored_paths", &s.ignored_paths.join("\n"))?;
+        self.set(&scope, "feedback_path", &s.feedback_path)?;
+        self.set_bool(&scope, "live_refresh", s.live_refresh)
     }
 
     pub fn touch_recent(&self, repo: &Path) -> Result<()> {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs() as i64)
-            .unwrap_or_default();
+        let now = now();
         self.conn.execute(
             "INSERT INTO recent_repos (path, opened_at) VALUES (?1, ?2)
              ON CONFLICT (path) DO UPDATE SET opened_at = excluded.opened_at",
@@ -155,28 +206,6 @@ impl Store {
         let mut stmt = self.conn.prepare("SELECT path FROM recent_repos ORDER BY opened_at DESC, rowid DESC LIMIT ?1")?;
         let rows = stmt.query_map([limit as i64], |r| r.get::<_, String>(0))?;
         Ok(rows.filter_map(|r| r.ok()).map(PathBuf::from).collect())
-    }
-
-    pub fn reviewed_files(&self, repo: &Path, commit: &str) -> Result<HashSet<String>> {
-        let mut stmt = self.conn.prepare("SELECT path FROM reviewed_files WHERE repo = ?1 AND commit_id = ?2")?;
-        let rows = stmt.query_map(params![repo.to_string_lossy(), commit], |r| r.get::<_, String>(0))?;
-        Ok(rows.filter_map(|r| r.ok()).collect())
-    }
-
-    pub fn set_reviewed(&self, repo: &Path, commit: &str, path: &str, reviewed: bool) -> Result<()> {
-        let repo = repo.to_string_lossy();
-        if reviewed {
-            self.conn.execute(
-                "INSERT OR IGNORE INTO reviewed_files (repo, commit_id, path) VALUES (?1, ?2, ?3)",
-                params![repo, commit, path],
-            )?;
-        } else {
-            self.conn.execute(
-                "DELETE FROM reviewed_files WHERE repo = ?1 AND commit_id = ?2 AND path = ?3",
-                params![repo, commit, path],
-            )?;
-        }
-        Ok(())
     }
 }
 

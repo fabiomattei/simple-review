@@ -154,6 +154,11 @@ pub struct CommitPager {
 
 impl CommitPager {
     pub fn start(repo: Repo, tip: ObjectId, notify: Notify) -> Self {
+        Self::start_range(repo, tip, Vec::new(), notify)
+    }
+
+    /// Like [`Self::start`], but stops at commits reachable from `hidden` (`hidden..tip`).
+    pub fn start_range(repo: Repo, tip: ObjectId, hidden: Vec<ObjectId>, notify: Notify) -> Self {
         let (requests, request_rx) = unbounded::<usize>();
         let (event_tx, events) = unbounded();
         thread::Builder::new()
@@ -161,7 +166,7 @@ impl CommitPager {
             .spawn(move || {
                 let Ok(mut wanted) = request_rx.recv() else { return };
                 let mut batch = Vec::new();
-                let result = repo.walk_commits(tip, |commit| {
+                let result = repo.walk_range(tip, &hidden, |commit| {
                     batch.push(commit);
                     if batch.len() < wanted {
                         return ControlFlow::Continue(());

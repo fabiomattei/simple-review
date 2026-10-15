@@ -183,14 +183,21 @@ impl Repo {
     }
 
     /// Walk history from `tip`, newest first, calling `f` for each commit until it returns `Break`.
-    pub fn walk_commits(
+    pub fn walk_commits(&self, tip: ObjectId, f: impl FnMut(CommitInfo) -> ControlFlow<()>) -> Result<()> {
+        self.walk_range(tip, &[], f)
+    }
+
+    /// Walk history from `tip`, newest first, excluding everything reachable from `hidden`.
+    pub fn walk_range(
         &self,
         tip: ObjectId,
+        hidden: &[ObjectId],
         mut f: impl FnMut(CommitInfo) -> ControlFlow<()>,
     ) -> Result<()> {
         let repo = self.local();
         let walk = repo
             .rev_walk([tip])
+            .with_hidden(hidden.iter().copied())
             .sorting(Sorting::ByCommitTime(CommitTimeOrder::NewestFirst))
             .all()?;
         let mailmap = repo.open_mailmap();
@@ -222,6 +229,38 @@ impl Repo {
         let mut out: Vec<FileChange> = changes.into_iter().filter_map(file_change).collect();
         out.sort_by(|a, b| a.path().cmp(b.path()));
         Ok(out)
+    }
+
+    pub fn merge_base(&self, a: ObjectId, b: ObjectId) -> Result<Option<ObjectId>> {
+        let repo = self.local();
+        Ok(repo.merge_base(a, b)?.map(|id| id.detach()))
+    }
+
+    /// Short names of local branches, then tags.
+    pub fn ref_names(&self) -> Result<Vec<String>> {
+        let repo = self.local();
+        let refs = repo.references()?;
+        let mut names = Vec::new();
+        for r in refs.local_branches()?.chain(refs.tags()?).flatten() {
+            names.push(r.name().shorten().to_str_lossy().into_owned());
+        }
+        Ok(names)
+    }
+
+    /// Short name of the checked-out branch, if any.
+    pub fn current_branch(&self) -> Option<String> {
+        let repo = self.local();
+        let name = repo.head_name().ok()??;
+        Some(name.shorten().to_str_lossy().into_owned())
+    }
+
+    /// `user.name` / `user.email` from git config, for comment authorship.
+    pub fn user_identity(&self) -> (String, String) {
+        let repo = self.local();
+        match repo.author() {
+            Some(Ok(sig)) => (sig.name.to_str_lossy().into_owned(), sig.email.to_str_lossy().into_owned()),
+            _ => ("You".to_string(), String::new()),
+        }
     }
 
     /// Every file (not directory) in the tree of `commit`, sorted by path.

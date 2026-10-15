@@ -36,7 +36,7 @@ fn lists_commits_newest_first() {
         ControlFlow::Continue(())
     })
     .unwrap();
-    assert_eq!(all.len(), fx.commits.len());
+    assert_eq!(all.len(), fx.main_commit_count());
     assert_eq!(all[0].summary, "Convert routes to CRLF");
     assert_eq!(all.last().unwrap().summary, "Initial Laravel skeleton");
     assert!(all.windows(2).all(|w| w[0].committer.time >= w[1].committer.time));
@@ -72,7 +72,7 @@ fn pager_delivers_pages_on_request() {
     assert_eq!(first.len(), 5);
     pager.request(100);
     let Some(PagerEvent::Batch(rest)) = pager.recv() else { panic!("expected a batch") };
-    assert_eq!(first.len() + rest.len(), fx.commits.len());
+    assert_eq!(first.len() + rest.len(), fx.main_commit_count());
     assert!(matches!(pager.recv(), Some(PagerEvent::Done)));
 }
 
@@ -278,5 +278,100 @@ mod phase2 {
         let b = blame_file(&repo, parse_id(fx.commit("old_laptop")).unwrap(), "composer.json", &[]).unwrap();
         let c = b.commits.iter().find(|c| c.id == parse_id(fx.commit("old_laptop")).unwrap()).unwrap();
         assert_eq!((c.author.name.as_str(), c.author.email.as_str()), ("Bob Backend", "bob@example.com"));
+    }
+}
+
+mod phase3 {
+    use super::*;
+    use review_core::range;
+    use review_core::review::export::{HeadLocation, locate_at};
+    use review_core::review::{Anchor, Placement, Thread, ThreadSide, ThreadStatus};
+    use review_core::watch::RepoWatcher;
+
+    #[test]
+    fn resolves_ranges() {
+        let (_dir, fx, repo) = setup();
+        let r = range::resolve(&repo, "main...topic").unwrap();
+        assert_eq!(r.base.to_string(), fx.commit("crlf"));
+        assert_eq!(r.tip.to_string(), fx.commit("topic_test"));
+        let files = repo.changed_files(Some(r.base), r.tip).unwrap();
+        let paths: Vec<_> = files.iter().map(|f| f.path()).collect();
+        assert_eq!(paths, vec!["app/Services/InvoiceService.php", "tests/Unit/InvoiceServiceTest.php"]);
+        let mut commits = Vec::new();
+        repo.walk_range(r.tip, &[r.base], |c| {
+            commits.push(c.summary);
+            ControlFlow::Continue(())
+        })
+        .unwrap();
+        assert_eq!(commits, vec!["Test invoice totals", "Raise discount threshold"]);
+
+        let two_dot = range::resolve(&repo, &format!("{}..{}", fx.commit("rename"), fx.commit("move"))).unwrap();
+        assert_eq!(two_dot.base.to_string(), fx.commit("rename"));
+        let single = range::resolve(&repo, "topic").unwrap();
+        assert_eq!(single.base.to_string(), fx.commit("topic_discount"));
+        assert!(range::resolve(&repo, "nope...topic").is_err());
+        assert_eq!(range::base_branch(&repo, "develop").as_deref(), Some("main"));
+        assert_eq!(repo.current_branch().as_deref(), Some("main"));
+        let names = repo.ref_names().unwrap();
+        assert!(names.contains(&"topic".to_string()) && names.contains(&"feature".to_string()));
+    }
+
+    #[test]
+    fn thread_follows_code_to_head() {
+        let (_dir, fx, repo) = setup();
+        let path = "app/Services/InvoiceService.php";
+        let at_move = parse_id(fx.commit("move")).unwrap();
+        let lines: Vec<String> = String::from_utf8(repo.read_blob(repo.find_file(at_move, path).unwrap().unwrap().id).unwrap())
+            .unwrap()
+            .lines()
+            .map(String::from)
+            .collect();
+        let line = lines.iter().position(|l| l.contains("$sum = 0;")).unwrap() as u32;
+        let mut thread = Thread {
+            id: 1,
+            commit_id: fx.commit("move").into(),
+            version_id: fx.commit("move").into(),
+            version_time: 0,
+            path: path.into(),
+            side: ThreadSide::New,
+            start_line: line,
+            end_line: line,
+            anchor: Anchor::capture(&lines, line, line),
+            status: ThreadStatus::Open,
+            created_at: 0,
+            updated_at: 0,
+            comments: vec![],
+        };
+        let head = repo.head_id().unwrap().unwrap();
+        // Pint reformatted the line, but `ai` rewrote the file in the original style.
+        assert_eq!(locate_at(&repo, head, &thread), HeadLocation::At(Placement::Exact { start: line, end: line }));
+        // At `pint` itself the line only matches when whitespace is ignored.
+        let pint = parse_id(fx.commit("pint")).unwrap();
+        assert_eq!(locate_at(&repo, pint, &thread), HeadLocation::At(Placement::Moved { start: line, end: line }));
+
+        let round = lines.iter().position(|l| l.contains("$rounded = round(")).unwrap() as u32;
+        thread.anchor = Anchor::capture(&lines, round, round);
+        thread.start_line = round;
+        // The discount method was inserted above it in `ai`.
+        let HeadLocation::At(Placement::Moved { start, .. }) = locate_at(&repo, head, &thread) else { panic!() };
+        assert!(start > round);
+
+        thread.path = "app/Helpers/legacy.php".into();
+        assert_eq!(locate_at(&repo, head, &thread), HeadLocation::FileMissing);
+    }
+
+    #[test]
+    fn watcher_sees_new_commits() {
+        let (_dir, fx, repo) = setup();
+        let watcher = RepoWatcher::start(&repo.git_dir(), Arc::new(|| {})).unwrap();
+        assert!(!watcher.take_changed());
+        let status = std::process::Command::new("git")
+            .args(["-c", "user.name=T", "-c", "user.email=t@x", "commit", "-q", "--allow-empty", "-m", "live"])
+            .current_dir(&fx.path)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .status()
+            .unwrap();
+        assert!(status.success());
+        assert!(watcher.wait(std::time::Duration::from_secs(10)), "no change event");
     }
 }

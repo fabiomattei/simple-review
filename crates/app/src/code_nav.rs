@@ -281,6 +281,7 @@ impl ReviewApp {
                 parent_idx: sc.parent_idx,
                 path: Some(path.to_string()),
                 browse: Some(commit),
+                base: sc.base,
             });
         }
         sc.file = Some(sf);
