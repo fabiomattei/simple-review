@@ -68,7 +68,7 @@ fn browse_commits_and_navigate_diffs() {
     wait_until(&mut harness, "first diff", view_ready);
     assert_eq!(current_summary(harness.state()).as_deref(), Some("Convert routes to CRLF"));
     assert_eq!(current_path(harness.state()).as_deref(), Some("routes/web.php"));
-    assert_eq!(harness.state().rs.as_ref().unwrap().commits.len(), fx.commits.len());
+    assert_eq!(harness.state().rs.as_ref().unwrap().commits.len(), fx.main_commit_count());
 
     // Jump to the commit that moved a block, and check the moved rows reach the view.
     let idx = harness.state().rs.as_ref().unwrap().commits.iter().position(|c| c.summary.starts_with("Move round()")).unwrap();
@@ -248,4 +248,124 @@ fn definitions_references_blame_and_tree() {
     wait_until(&mut harness, "browse", view_ready);
     assert!(harness.state().rs.as_ref().unwrap().commit.as_ref().unwrap().file.as_ref().unwrap().browse.is_some());
     snapshot(&mut harness, "all_files_browse");
+}
+
+fn file_ready(app: &ReviewApp, path: &str) -> bool {
+    view_ready(app) && current_path(app).as_deref() == Some(path)
+}
+
+fn select_summary(harness: &mut Harness<'_, ReviewApp>, prefix: &str) {
+    let idx = harness.state().rs.as_ref().unwrap().commits.iter().position(|c| c.summary.starts_with(prefix)).unwrap();
+    harness.state_mut().apply(Action::SelectCommit(idx));
+}
+
+#[test]
+fn comments_export_ranges_and_live_refresh() {
+    use review_core::review::{Placement, ThreadStatus};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let fx = fixture::build(&tmp.path().join("repo")).unwrap();
+    let path = fx.path.clone();
+    let mut harness = Harness::builder()
+        .with_size(egui::vec2(1400.0, 900.0))
+        .wgpu()
+        .build_eframe(move |cc| {
+            cc.egui_ctx.set_visuals(egui::Visuals::dark());
+            ReviewApp::with_store(cc, Store::in_memory(), Some(path))
+        });
+    let invoice = "app/Services/InvoiceService.php";
+    wait_until(&mut harness, "first diff", view_ready);
+    select_summary(&mut harness, "Move round()");
+    wait_until(&mut harness, "move diff", |app| file_ready(app, invoice));
+
+    // Select two lines on the new side and comment on them.
+    let (line, _) = line_of(harness.state(), Side::New, "$rounded = round(");
+    harness.state_mut().apply(Action::SetCursor(Cursor { side: Side::New, line, col: 0 }));
+    harness.state_mut().apply(Action::SelectTo(Cursor { side: Side::New, line: line + 1, col: 0 }));
+    harness.key_press(Key::C);
+    harness.run_steps(2);
+    let editor = harness.state_mut().comment_editor.as_mut().expect("editor opened");
+    assert!(editor.context.contains("lines"));
+    editor.text = "Extract the **rounding** into a helper.".into();
+    harness.state_mut().apply(Action::SaveComment);
+    harness.run_steps(3);
+    let thread_id = {
+        let app = harness.state();
+        let rs = app.rs.as_ref().unwrap();
+        assert_eq!(rs.threads.len(), 1);
+        let t = &rs.threads[0];
+        assert_eq!((t.start_line, t.end_line, t.path.as_str()), (line, line + 1, invoice));
+        assert_eq!(app.thread_marks().len(), 1);
+        t.id
+    };
+    harness.state_mut().apply(Action::ReplyTo(thread_id));
+    harness.state_mut().comment_editor.as_mut().unwrap().text = "And cover it with a test.".into();
+    harness.state_mut().apply(Action::SaveComment);
+    harness.run_steps(3);
+    assert_eq!(harness.state().rs.as_ref().unwrap().threads[0].comments.len(), 2);
+    wait_until(&mut harness, "highlighting", |app| app.hl_pending.is_empty());
+    snapshot(&mut harness, "comment_thread");
+
+    // At a later commit the thread follows the code (a method was inserted above it).
+    select_summary(&mut harness, "Add volume discount");
+    wait_until(&mut harness, "ai diff", |app| file_ready(app, invoice));
+    harness.run_steps(2);
+    {
+        let sf = harness.state().rs.as_ref().unwrap().commit.as_ref().unwrap().file.as_ref().unwrap();
+        let (_, placed) = sf.placed.as_ref().expect("placed");
+        assert_eq!(placed.len(), 1);
+        let Placement::Moved { start, .. } = placed[0].placement else { panic!("{:?}", placed[0].placement) };
+        let (now, _) = line_of(harness.state(), Side::New, "$rounded = round(");
+        assert_eq!(start, now);
+    }
+
+    // Export for Claude Code.
+    harness.state_mut().apply(Action::WriteFeedback);
+    let feedback = fx.path.join("REVIEW_FEEDBACK.md");
+    wait_until(&mut harness, "feedback file", |_| feedback.exists());
+    let text = std::fs::read_to_string(&feedback).unwrap();
+    assert!(text.contains("1 open comment"), "{text}");
+    assert!(text.contains(&format!("`{invoice}` lines")), "{text}");
+    assert!(text.contains("> Extract the **rounding** into a helper."));
+    assert!(text.contains("**Follow-up**"));
+    std::fs::remove_file(&feedback).unwrap();
+
+    // Resolve: no longer exported, still listed under "Closed".
+    harness.state_mut().apply(Action::SetThreadStatus(thread_id, ThreadStatus::Resolved));
+    assert_eq!(harness.state().rs.as_ref().unwrap().threads[0].status, ThreadStatus::Resolved);
+    assert!(harness.state().comments_view().rows.is_empty());
+    harness.state_mut().apply(Action::CommentStatusFilter(crate::state::StatusFilter::Closed));
+    assert_eq!(harness.state().comments_view().rows.len(), 1);
+
+    // Range review: main...topic.
+    harness.state_mut().apply(Action::CompareRange("main...topic".into()));
+    wait_until(&mut harness, "range diff", |app| {
+        let rs = app.rs.as_ref().unwrap();
+        rs.range.is_some()
+            && rs.commits.len() == 2
+            && rs.commit.as_ref().is_some_and(|c| c.base.is_some() && matches!(c.files, FilesState::Ready(ref f) if f.len() == 2))
+            && view_ready(app)
+    });
+    harness.key_press(Key::R);
+    harness.run_steps(1);
+    {
+        let sc = harness.state().rs.as_ref().unwrap().commit.as_ref().unwrap();
+        assert_eq!(sc.review_key(), format!("{}..{}", fx.commit("crlf"), fx.commit("topic_test")));
+        assert_eq!(sc.reviewed.len(), 1);
+    }
+    snapshot(&mut harness, "range_review");
+    harness.state_mut().apply(Action::ExitRange);
+    wait_until(&mut harness, "full history", |app| app.rs.as_ref().unwrap().commits.len() == fx.main_commit_count());
+
+    // Live refresh: a commit made outside the app shows up.
+    let status = std::process::Command::new("git")
+        .args(["-c", "user.name=Claude", "-c", "user.email=c@x", "commit", "-q", "--allow-empty", "-m", "Made by Claude Code"])
+        .current_dir(&fx.path)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .status()
+        .unwrap();
+    assert!(status.success());
+    wait_until(&mut harness, "live refresh", |app| {
+        app.rs.as_ref().unwrap().commits.first().is_some_and(|c| c.summary == "Made by Claude Code")
+    });
 }
