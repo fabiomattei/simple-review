@@ -26,27 +26,28 @@ fn decode_lines(s: &str) -> Vec<String> {
     it.take(n).map(str::to_string).collect()
 }
 
-const THREAD_COLUMNS: &str = "id, commit_id, version_id, version_time, path, side, start_line, end_line,
+const THREAD_COLUMNS: &str = "id, uid, commit_id, version_id, version_time, path, side, start_line, end_line,
      anchor_before, anchor_lines, anchor_after, status, created_at, updated_at";
 
 fn thread_from_row(r: &Row<'_>) -> rusqlite::Result<Thread> {
     Ok(Thread {
         id: r.get(0)?,
-        commit_id: r.get(1)?,
-        version_id: r.get(2)?,
-        version_time: r.get(3)?,
-        path: r.get(4)?,
-        side: ThreadSide::parse(&r.get::<_, String>(5)?),
-        start_line: r.get(6)?,
-        end_line: r.get(7)?,
+        uid: r.get::<_, Option<String>>(1)?.unwrap_or_default(),
+        commit_id: r.get(2)?,
+        version_id: r.get(3)?,
+        version_time: r.get(4)?,
+        path: r.get(5)?,
+        side: ThreadSide::parse(&r.get::<_, String>(6)?),
+        start_line: r.get(7)?,
+        end_line: r.get(8)?,
         anchor: Anchor {
-            before: decode_lines(&r.get::<_, String>(8)?),
-            lines: decode_lines(&r.get::<_, String>(9)?),
-            after: decode_lines(&r.get::<_, String>(10)?),
+            before: decode_lines(&r.get::<_, String>(9)?),
+            lines: decode_lines(&r.get::<_, String>(10)?),
+            after: decode_lines(&r.get::<_, String>(11)?),
         },
-        status: ThreadStatus::parse(&r.get::<_, String>(11)?),
-        created_at: r.get(12)?,
-        updated_at: r.get(13)?,
+        status: ThreadStatus::parse(&r.get::<_, String>(12)?),
+        created_at: r.get(13)?,
+        updated_at: r.get(14)?,
         comments: Vec::new(),
     })
 }
@@ -57,10 +58,11 @@ impl Store {
             bail!("a comment needs some text");
         }
         let now = now();
+        let uid: String = self.conn.query_row("SELECT lower(hex(randomblob(8)))", [], |r| r.get(0))?;
         self.conn.execute(
-            "INSERT INTO threads (repo, commit_id, version_id, version_time, path, side, start_line, end_line,
+            "INSERT INTO threads (repo, uid, commit_id, version_id, version_time, path, side, start_line, end_line,
                                   anchor_before, anchor_lines, anchor_after, status, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 'open', ?12, ?12)",
+             VALUES (?1, ?13, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 'open', ?12, ?12)",
             params![
                 repo.to_string_lossy(),
                 t.commit_id,
@@ -74,6 +76,7 @@ impl Store {
                 encode_lines(&t.anchor.lines),
                 encode_lines(&t.anchor.after),
                 now,
+                uid,
             ],
         )?;
         let id = self.conn.last_insert_rowid();
@@ -183,6 +186,72 @@ impl Store {
             }
         }
         Ok(threads)
+    }
+
+    /// Insert or merge a thread read from a shared file. Returns (thread created, comments added).
+    pub fn merge_shared_thread(&self, repo: &Path, t: &Thread) -> Result<(bool, usize)> {
+        let repo_s = repo.to_string_lossy();
+        let existing: Option<(i64, i64)> = self
+            .conn
+            .query_row("SELECT id, updated_at FROM threads WHERE repo = ?1 AND uid = ?2", params![repo_s, t.uid], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .optional()?;
+        let (id, created) = match existing {
+            Some((id, updated_at)) => {
+                // The newer side wins for the status.
+                if t.updated_at > updated_at {
+                    self.conn.execute(
+                        "UPDATE threads SET status = ?1, updated_at = ?2 WHERE id = ?3",
+                        params![t.status.as_str(), t.updated_at, id],
+                    )?;
+                }
+                (id, false)
+            }
+            None => {
+                self.conn.execute(
+                    "INSERT INTO threads (repo, uid, commit_id, version_id, version_time, path, side, start_line, end_line,
+                                          anchor_before, anchor_lines, anchor_after, status, created_at, updated_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+                    params![
+                        repo_s,
+                        t.uid,
+                        t.commit_id,
+                        t.version_id,
+                        t.version_time,
+                        t.path,
+                        t.side.as_str(),
+                        t.start_line,
+                        t.end_line,
+                        encode_lines(&t.anchor.before),
+                        encode_lines(&t.anchor.lines),
+                        encode_lines(&t.anchor.after),
+                        t.status.as_str(),
+                        t.created_at,
+                        t.updated_at,
+                    ],
+                )?;
+                (self.conn.last_insert_rowid(), true)
+            }
+        };
+        let mut added = 0;
+        for c in &t.comments {
+            // A comment is the same if author, time and text match.
+            let known: i64 = self.conn.query_row(
+                "SELECT COUNT(*) FROM comments WHERE thread_id = ?1 AND author_email = ?2 AND created_at = ?3 AND body = ?4",
+                params![id, c.author_email, c.created_at, c.body],
+                |r| r.get(0),
+            )?;
+            if known == 0 {
+                self.conn.execute(
+                    "INSERT INTO comments (thread_id, author_name, author_email, body, created_at, updated_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    params![id, c.author_name, c.author_email, c.body, c.created_at, c.updated_at],
+                )?;
+                added += 1;
+            }
+        }
+        Ok((created, added))
     }
 
     /// Files marked reviewed for a commit or range key.

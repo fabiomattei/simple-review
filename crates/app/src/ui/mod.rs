@@ -26,6 +26,8 @@ use crate::state::{CommentScope, Cursor, PeekTab, StatusFilter};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Action {
+    ShareThreads,
+    ImportThreads,
     CheckUpdates,
     InstallUpdate,
     AddBookmark,

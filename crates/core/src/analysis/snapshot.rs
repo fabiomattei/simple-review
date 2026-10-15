@@ -14,6 +14,8 @@ use crate::git::{EntryType, Repo};
 /// Linked from the working copy when the commit's tree doesn't contain them.
 const LINKED: &[&str] = &["vendor", "node_modules", ".env"];
 const COMPLETE_MARKER: &str = ".simple-review-snapshot";
+/// Written into a snapshot's `vendor/` built by [`link_vendor`].
+const LINK_MARKER: &str = ".simple-review-linked";
 
 #[derive(Debug, Clone)]
 pub struct Snapshot {
@@ -67,7 +69,8 @@ pub fn ensure(repo: &Repo, commit: ObjectId, cache: &Path, cancelled: &dyn Fn() 
     // Touch for least-recently-used pruning.
     let _ = std::fs::write(dir.join(COMPLETE_MARKER), commit.to_string());
 
-    let vendor_linked = std::fs::symlink_metadata(dir.join("vendor")).is_ok_and(|m| m.file_type().is_symlink());
+    let vendor_linked = dir.join("vendor").join(LINK_MARKER).exists()
+        || std::fs::symlink_metadata(dir.join("vendor")).is_ok_and(|m| m.file_type().is_symlink());
     let vendor_mismatch = vendor_linked && {
         let in_commit = repo.find_file(commit, "composer.lock").ok().flatten().and_then(|f| repo.read_blob(f.id).ok());
         let in_worktree = std::fs::read(repo.root().join("composer.lock")).ok();
@@ -110,6 +113,10 @@ fn write_tree(repo: &Repo, commit: ObjectId, dir: &Path, cancelled: &dyn Fn() ->
     for name in LINKED {
         let source = repo.root().join(name);
         let target = dir.join(name);
+        if *name == "vendor" && source.is_dir() && std::fs::symlink_metadata(&target).is_err() {
+            link_vendor(&source, &target)?;
+            continue;
+        }
         if source.exists() && std::fs::symlink_metadata(&target).is_err() {
             #[cfg(unix)]
             let _ = std::os::unix::fs::symlink(&source, &target);
@@ -122,6 +129,44 @@ fn write_tree(repo: &Repo, commit: ObjectId, dir: &Path, cancelled: &dyn Fn() ->
         }
     }
     std::fs::write(dir.join(COMPLETE_MARKER), commit.to_string())?;
+    Ok(())
+}
+
+/// Mirror the working copy's `vendor/` into the snapshot with hard links.
+///
+/// Tools must see the snapshot as the project root: Composer's autoloader and PHPStan locate
+/// files from their own `__DIR__`, and PHP resolves symlinks there, so a symlinked `vendor/`
+/// (or symlinked packages) would load the working copy's classes, or Composer twice. Hard links
+/// give every file a path inside the snapshot without using extra space; across file systems
+/// files are copied instead.
+fn link_vendor(source: &Path, target: &Path) -> Result<()> {
+    mirror(source, target)?;
+    std::fs::write(target.join(LINK_MARKER), "")?;
+    Ok(())
+}
+
+fn mirror(from: &Path, to: &Path) -> Result<()> {
+    std::fs::create_dir_all(to)?;
+    for entry in std::fs::read_dir(from)? {
+        let entry = entry?;
+        let (src, dst) = (entry.path(), to.join(entry.file_name()));
+        let meta = std::fs::symlink_metadata(&src)?;
+        if meta.file_type().is_symlink() {
+            // Keep the link as written (usually relative, so it resolves inside the mirror).
+            #[cfg(unix)]
+            std::os::unix::fs::symlink(std::fs::read_link(&src)?, &dst)?;
+            #[cfg(not(unix))]
+            if std::fs::metadata(&src).is_ok_and(|m| m.is_dir()) {
+                mirror(&src, &dst)?;
+            } else {
+                std::fs::copy(&src, &dst)?;
+            }
+        } else if meta.is_dir() {
+            mirror(&src, &dst)?;
+        } else if std::fs::hard_link(&src, &dst).is_err() {
+            std::fs::copy(&src, &dst)?;
+        }
+    }
     Ok(())
 }
 

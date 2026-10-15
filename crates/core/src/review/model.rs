@@ -94,6 +94,8 @@ pub struct Comment {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Thread {
     pub id: i64,
+    /// Stable across machines: the file name when shared in `.reviews/`.
+    pub uid: String,
     /// The commit (or range tip) being reviewed when the thread was created.
     pub commit_id: String,
     /// The commit whose tree contains the commented lines (the parent for `Old`).

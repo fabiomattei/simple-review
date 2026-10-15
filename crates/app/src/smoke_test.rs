@@ -679,3 +679,39 @@ fn tabs_bookmarks_and_preferences() {
     assert_eq!(harness.state().tab_labels(), (vec!["other".to_string()], 0));
     assert_eq!(harness.state().rs.as_ref().unwrap().bookmarks.len(), 0, "bookmarks are per repository");
 }
+
+#[test]
+fn share_and_import_threads() {
+    let tmp = tempfile::tempdir().unwrap();
+    let fx = fixture::build(&tmp.path().join("repo")).unwrap();
+    let path = fx.path.clone();
+    let mut harness = Harness::builder()
+        .with_size(egui::vec2(1200.0, 800.0))
+        .build_eframe(move |cc| ReviewApp::with_store(cc, Store::in_memory(), Some(path)));
+    wait_until(&mut harness, "first diff", view_ready);
+
+    // Comment on a line, then share.
+    let (line, _) = line_of(harness.state(), Side::New, "Route::get");
+    harness.state_mut().apply(Action::SetCursor(Cursor { side: Side::New, line, col: 0 }));
+    harness.state_mut().apply(Action::StartComment);
+    harness.state_mut().comment_editor.as_mut().unwrap().text = "Name this route.".into();
+    harness.state_mut().apply(Action::SaveComment);
+    harness.state_mut().apply(Action::ShareThreads);
+    let dir = fx.path.join(".reviews");
+    let files: Vec<_> = std::fs::read_dir(&dir).unwrap().flatten().collect();
+    assert_eq!(files.len(), 1);
+    let text = std::fs::read_to_string(files[0].path()).unwrap();
+    assert!(text.contains("Name this route.") && text.contains("path: routes/web.php"));
+
+    // A teammate's reply arrives in the file; importing merges it.
+    let reply = "\n### Teammate <t@x> · 2026-10-15 09:00 UTC\n<!-- comment created=1792000000 updated=1792000000 -->\n\nDone.\n";
+    std::fs::write(files[0].path(), format!("{text}{reply}")).unwrap();
+    harness.state_mut().apply(Action::ImportThreads);
+    let threads = &harness.state().rs.as_ref().unwrap().threads;
+    assert_eq!(threads.len(), 1);
+    assert_eq!(threads[0].comments.len(), 2);
+    assert!(threads[0].comments.iter().any(|c| c.author_name == "Teammate" && c.body == "Done."));
+    // Importing again changes nothing.
+    harness.state_mut().apply(Action::ImportThreads);
+    assert_eq!(harness.state().rs.as_ref().unwrap().threads[0].comments.len(), 2);
+}

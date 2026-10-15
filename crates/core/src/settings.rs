@@ -131,6 +131,10 @@ const MIGRATIONS: &[&str] = &[
          note TEXT NOT NULL,
          created_at INTEGER NOT NULL);
      CREATE INDEX bookmarks_by_repo ON bookmarks (repo);",
+    // A stable id per thread, used when sharing threads as files in `.reviews/`.
+    "ALTER TABLE threads ADD COLUMN uid TEXT;
+     UPDATE threads SET uid = lower(hex(randomblob(8))) WHERE uid IS NULL;
+     CREATE UNIQUE INDEX threads_by_uid ON threads (repo, uid);",
 ];
 
 /// Current Unix time in seconds.

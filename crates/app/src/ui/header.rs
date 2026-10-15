@@ -66,6 +66,14 @@ pub fn toolbar(ui: &mut Ui, s: &ToolbarState<'_>, actions: &mut Vec<Action>) {
                     actions.push(Action::CopyFeedback);
                     ui.close();
                 }
+                if ui.button("Share comments to .reviews/").on_hover_text("One Markdown file per thread, in the repository").clicked() {
+                    actions.push(Action::ShareThreads);
+                    ui.close();
+                }
+                if ui.button("Import comments from .reviews/").clicked() {
+                    actions.push(Action::ImportThreads);
+                    ui.close();
+                }
                 if ui.button("Save review report…").clicked() {
                     actions.push(Action::SaveReport);
                     ui.close();

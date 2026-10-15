@@ -329,6 +329,7 @@ mod phase3 {
         let line = lines.iter().position(|l| l.contains("$sum = 0;")).unwrap() as u32;
         let mut thread = Thread {
             id: 1,
+            uid: "0123456789abcdef".into(),
             commit_id: fx.commit("move").into(),
             version_id: fx.commit("move").into(),
             version_time: 0,
@@ -427,10 +428,19 @@ mod phase4 {
         let (dir, fx, repo) = setup();
         std::fs::create_dir_all(fx.path.join("vendor/bin")).unwrap();
         std::fs::write(fx.path.join("vendor/autoload.php"), "<?php\n").unwrap();
+        std::fs::create_dir_all(fx.path.join("vendor/composer")).unwrap();
+        std::fs::write(fx.path.join("vendor/composer/autoload_psr4.php"), "<?php return [];\n").unwrap();
+        std::fs::create_dir_all(fx.path.join("vendor/acme/pkg")).unwrap();
         let cache = dir.path().join("cache");
         let id = parse_id(fx.commit("move")).unwrap();
         let snap = snapshot::ensure(&repo, id, &cache, &|| false).unwrap();
         assert!(snap.vendor_linked && !snap.vendor_mismatch);
+        // vendor/ is mirrored with hard links, so every file lives inside the snapshot.
+        let meta = |p: &str| std::fs::symlink_metadata(snap.dir.join(p)).unwrap();
+        assert!(meta("vendor").is_dir() && !meta("vendor").file_type().is_symlink());
+        assert!(!meta("vendor/composer").file_type().is_symlink());
+        assert!(!meta("vendor/autoload.php").file_type().is_symlink());
+        assert!(meta("vendor/acme").is_dir() && !meta("vendor/acme").file_type().is_symlink());
         let text = std::fs::read_to_string(snap.dir.join("app/Services/InvoiceService.php")).unwrap();
         assert!(text.contains("forUser"));
         assert!(snap.dir.join("app/Helpers/legacy.php").exists(), "deleted only later, in `delete`");

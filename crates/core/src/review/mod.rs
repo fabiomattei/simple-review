@@ -4,6 +4,7 @@ pub mod anchor;
 pub mod bookmarks;
 pub mod export;
 pub mod model;
+pub mod sharing;
 pub mod store;
 
 pub use anchor::{Placement, relocate};

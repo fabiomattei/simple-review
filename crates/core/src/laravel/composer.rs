@@ -154,6 +154,18 @@ mod tests {
         assert!(matches!(&d[3], PackageChange::Removed { name, .. } if name == "old/pkg"));
     }
 
+    /// Real `composer audit --format=json` output may be checked with
+    /// `AUDIT_JSON=<file> cargo test -p review-core real_audit -- --ignored`.
+    #[test]
+    #[ignore]
+    fn real_audit_output() {
+        let Ok(path) = std::env::var("AUDIT_JSON") else { return };
+        let a = parse_audit(&std::fs::read_to_string(path).unwrap()).unwrap();
+        assert!(!a.is_empty());
+        assert!(a.iter().all(|a| !a.package.is_empty() && !a.title.is_empty()), "{a:#?}");
+        eprintln!("{} advisories, first: {:?}", a.len(), a[0]);
+    }
+
     #[test]
     fn parses_audit_output() {
         let json = r#"{"advisories":{"guzzlehttp/guzzle":[{"advisoryId":"PKSA-1","packageName":"guzzlehttp/guzzle","title":"Cookie leak","cve":"CVE-2022-29248","link":"https://example.test","affectedVersions":"<7.4.3","severity":"high"}]},"abandoned":[]}"#;

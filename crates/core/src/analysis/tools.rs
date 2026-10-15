@@ -114,15 +114,24 @@ fn dir_spellings(dir: &Path) -> Vec<String> {
     v
 }
 
-/// Parse `phpstan analyse --error-format=json` output.
+/// Parse `phpstan analyse --error-format=json` output. Also accepts the compact format PHPStan
+/// prints when it detects a coding agent in the environment (`error_details`).
 pub fn parse_phpstan(json: &str, dir: &Path) -> Result<Vec<Warning>> {
     let start = json.find('{').context("PHPStan printed no JSON")?;
     let v: Value = serde_json::from_str(&json[start..]).context("PHPStan output is not valid JSON")?;
     let dirs = dir_spellings(dir);
     let mut out = Vec::new();
-    if let Some(files) = v.get("files").and_then(Value::as_object) {
-        for (file, data) in files {
-            for m in data.get("messages").and_then(Value::as_array).into_iter().flatten() {
+    let per_file: Vec<(&String, Vec<&Value>)> = match (v.get("files").and_then(Value::as_object), v.get("error_details").and_then(Value::as_object)) {
+        (Some(files), _) => files
+            .iter()
+            .map(|(f, data)| (f, data.get("messages").and_then(Value::as_array).into_iter().flatten().collect()))
+            .collect(),
+        (None, Some(details)) => details.iter().map(|(f, list)| (f, list.as_array().into_iter().flatten().collect())).collect(),
+        _ => Vec::new(),
+    };
+    {
+        for (file, messages) in per_file {
+            for m in messages {
                 out.push(Warning {
                     tool: Tool::PhpStan,
                     path: relative(file, &dirs),
@@ -149,7 +158,14 @@ pub fn parse_pint(json: &str, dir: &Path) -> Result<Vec<Warning>> {
     let mut out = Vec::new();
     for f in v.get("files").and_then(Value::as_array).into_iter().flatten() {
         let path = f.get("name").or(f.get("path")).and_then(Value::as_str).unwrap_or("");
-        let fixers: Vec<&str> = f.get("appliedFixers").and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str).collect();
+        let fixers: Vec<&str> = f
+            .get("appliedFixers")
+            .or(f.get("fixers"))
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .collect();
         let message = format!("Style: {}", if fixers.is_empty() { "formatting".to_string() } else { fixers.join(", ") });
         let lines = f.get("diff").and_then(Value::as_str).map(changed_lines).unwrap_or_default();
         let path = relative(path, &dirs);
@@ -199,7 +215,8 @@ pub fn analyse(tool: Tool, cmd: &[String], dir: &Path, paths: &[String], cancell
         Tool::PhpStan => ["analyse", "--error-format=json", "--no-progress", "--no-interaction", "--memory-limit=2G"]
             .map(String::from)
             .to_vec(),
-        Tool::Pint => ["--test", "--format=json"].map(String::from).to_vec(),
+        // -v adds the applied fixers and a diff, which gives line numbers.
+        Tool::Pint => ["--test", "--format=json", "-v"].map(String::from).to_vec(),
     };
     args.extend(paths.iter().cloned());
     let (stdout, stderr) = run(dir, cmd, &args, cancelled)?;
@@ -239,6 +256,28 @@ mod tests {
         assert_eq!(w[0].identifier.as_deref(), Some("return.type"));
         assert_eq!(w[2].path, "");
         assert!(parse_phpstan("Fatal error", dir).is_err());
+    }
+
+    #[test]
+    fn parses_agent_formats() {
+        // Real output of PHPStan 2 / Pint when AI_AGENT or CLAUDECODE is set.
+        let dir = Path::new("/tmp/shop");
+        let phpstan = r#"{"tool":"phpstan","result":"failed","errors":1,"error_details":{"/tmp/shop/app/Http/Controllers/InvoiceController.php":[{"line":13,"message":"Call to an undefined method App\\Models\\User::totalInvoices().","identifier":"method.notFound"}]},"instructions":"…"}"#;
+        let w = parse_phpstan(phpstan, dir).unwrap();
+        assert_eq!((w[0].path.as_str(), w[0].line), ("app/Http/Controllers/InvoiceController.php", Some(12)));
+        let pint = r#"{"tool":"pint","result":"fail","files":[{"path":"app\/Http\/Controllers\/InvoiceController.php","fixers":["blank_line_before_statement"]}]}"#;
+        let w = parse_pint(pint, dir).unwrap();
+        assert_eq!(w[0].path, "app/Http/Controllers/InvoiceController.php");
+        assert_eq!(w[0].message, "Style: blank_line_before_statement");
+    }
+
+    #[test]
+    fn parses_real_pint_verbose_output() {
+        // `pint --test --format=json -v`: an insertion-only hunk points at the line after it.
+        let json = r#"{"about":"PHP CS Fixer","files":[{"name":"app\/Http\/Controllers\/InvoiceController.php","appliedFixers":["blank_line_before_statement"],"diff":"--- \/tmp\/a.php\n+++ \/tmp\/a.php\n@@ -10,6 +10,7 @@\n     public function index(): JsonResponse\n     {\n         $users = User::query()->where('active', true)->get();\n+\n         return response()->json($users);\n     }\n \n"}],"time":{"total":0},"memory":0}"#;
+        let w = parse_pint(json, Path::new("/tmp")).unwrap();
+        assert_eq!(w.len(), 1);
+        assert_eq!(w[0].line, Some(12), "0-based line of `return response()…`");
     }
 
     #[test]

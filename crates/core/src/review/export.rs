@@ -243,6 +243,7 @@ mod tests {
     fn thread() -> Thread {
         Thread {
             id: 1,
+            uid: "0123456789abcdef".into(),
             commit_id: "1234567890abcdef".into(),
             version_id: "1234567890abcdef".into(),
             version_time: 0,

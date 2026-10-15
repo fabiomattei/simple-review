@@ -634,6 +634,26 @@ impl ReviewApp {
             }
             Action::OpenRepo(path) => self.open_repo_in_tab(&path),
             Action::SwitchTab(i) => self.switch_tab(i),
+            Action::ShareThreads => {
+                if let Some(rs) = &self.rs {
+                    match review_core::review::sharing::export(rs.repo.root(), &rs.threads) {
+                        Ok(n) => self.toast(format!("Wrote {n} thread(s) to .reviews/")),
+                        Err(e) => self.error = Some(format!("{e:#}")),
+                    }
+                }
+            }
+            Action::ImportThreads => {
+                if let (Some(rs), Some(store)) = (&self.rs, &self.store) {
+                    match review_core::review::sharing::import(store, rs.repo.root()) {
+                        Ok(r) => {
+                            let msg = format!("Imported {} thread(s), {} comment(s); {} file(s) skipped", r.threads_added, r.comments_added, r.files_skipped.len());
+                            self.toast(msg);
+                            self.load_threads();
+                        }
+                        Err(e) => self.error = Some(format!("{e:#}")),
+                    }
+                }
+            }
             Action::CheckUpdates => self.check_for_updates(true),
             Action::InstallUpdate => self.install_update(),
             Action::AddBookmark => self.add_bookmark(),
