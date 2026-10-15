@@ -86,6 +86,12 @@ pub struct ReviewApp {
     bookmark_notes: Vec<String>,
     check_updates: bool,
     update_available: Option<crate::updater::UpdateInfo>,
+    /// The user is dragging the peek panel's edge.
+    peek_resizing: bool,
+    /// Where the peek panel was last shown.
+    peek_rect: egui::Rect,
+    /// Where the sidebar's file list was last shown.
+    files_panel_rect: egui::Rect,
 }
 
 impl ReviewApp {
@@ -169,6 +175,9 @@ impl ReviewApp {
             bookmark_notes: Vec::new(),
             check_updates,
             update_available: None,
+            peek_resizing: false,
+            peek_rect: egui::Rect::NOTHING,
+            files_panel_rect: egui::Rect::NOTHING,
         };
         app.apply_prefs();
         if check_updates {
@@ -1261,11 +1270,13 @@ impl ReviewApp {
                 by_committer: shown.map(|b| b.share(true)).unwrap_or_default(),
                 error,
             };
-            egui::Panel::bottom("peek")
+            let peek = egui::Panel::bottom("peek")
                 .resizable(true)
-                .default_size(260.0)
+                .default_size(self.prefs.peek_height)
                 .min_size(120.0)
                 .show(ui, |ui| {
+                    // Fill the panel so short tabs don't shrink it (egui keeps the laid-out size).
+                    ui.set_min_height(ui.available_height());
                     let has_file = true;
                     let laravel_view = laravel_key.map(|k| ui::laravel::LaravelView {
                         data: self.laravel.data.get(&k),
@@ -1277,6 +1288,20 @@ impl ReviewApp {
                     let bookmarks = Some((rs.bookmarks.as_slice(), &mut self.bookmark_notes));
                     ui::peek::show(ui, &self.peek, &info, comments.as_ref(), quality.as_ref(), Some((&mut self.history_panel, has_file)), laravel, bookmarks, actions)
                 });
+            // Remember the height the user drags the panel's top edge to (not heights egui
+            // imposes to make it fit), and save it when the drag ends.
+            let rect = peek.response.rect;
+            self.peek_rect = rect;
+            let (down, origin) = ui.input(|i| (i.pointer.any_down(), i.pointer.press_origin()));
+            let on_edge = origin.is_some_and(|p| (p.y - rect.top()).abs() <= 8.0 && rect.x_range().contains(p.x));
+            if down && (on_edge || self.peek_resizing) {
+                self.peek_resizing = true;
+                self.prefs.peek_height = rect.height();
+            } else if !down && std::mem::take(&mut self.peek_resizing)
+                && let Some(store) = &self.store
+            {
+                self.prefs.save(store);
+            }
         }
 
         let message = |ui: &mut Ui, text: String, button: Option<&str>, actions: &mut Vec<Action>| {
@@ -1458,11 +1483,17 @@ impl eframe::App for ReviewApp {
             egui::Panel::left("sidebar").default_size(400.0).min_size(260.0).show(ui, |ui| {
                 if let Some(sc) = rs.commit.as_mut() {
                     let settings = &rs.settings;
-                    egui::Panel::bottom("files_panel")
+                    let files = egui::Panel::bottom("files_panel")
                         .resizable(true)
                         .default_size(ui.available_height() * 0.45)
                         .min_size(120.0)
-                        .show(ui, |ui| ui::files::show(ui, sc, settings, show_all, &mut self.file_filter, &mut actions));
+                        .show(ui, |ui| {
+                            // Fill the panel: egui keeps the laid-out size, so a short list (or the
+                            // loading spinner) would otherwise shrink it for good.
+                            ui.set_min_height(ui.available_height());
+                            ui::files::show(ui, sc, settings, show_all, &mut self.file_filter, &mut actions)
+                        });
+                    self.files_panel_rect = files.response.rect;
                 }
                 let (good, bad, skip) = (bisect.0.clone(), bisect.1, bisect.2.clone());
                 let marks = ui::commits::Marks { risks: &self.risks, good, bad, skip };

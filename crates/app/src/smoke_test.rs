@@ -70,6 +70,19 @@ fn browse_commits_and_navigate_diffs() {
     assert_eq!(current_path(harness.state()).as_deref(), Some("routes/web.php"));
     assert_eq!(harness.state().rs.as_ref().unwrap().commits.len(), fx.main_commit_count());
 
+    // Selecting commits doesn't resize the file list, even while it shows the loading spinner
+    // or a commit with fewer files.
+    let files_height = harness.state().files_panel_rect.height();
+    // About 45% of the sidebar, not collapsed to the 120-point minimum by the loading spinner.
+    assert!(files_height > 300.0, "file list collapsed to {files_height}");
+    for summary in ["Initial Laravel skeleton", "Remove legacy helper", "Convert routes to CRLF"] {
+        select_summary(&mut harness, summary);
+        harness.run_steps(1);
+        assert_eq!(harness.state().files_panel_rect.height(), files_height, "while loading {summary}");
+        wait_until(&mut harness, summary, view_ready);
+        assert_eq!(harness.state().files_panel_rect.height(), files_height, "after loading {summary}");
+    }
+
     // Jump to the commit that moved a block, and check the moved rows reach the view.
     let idx = harness.state().rs.as_ref().unwrap().commits.iter().position(|c| c.summary.starts_with("Move round()")).unwrap();
     harness.state_mut().apply(Action::SelectCommit(idx));
@@ -193,6 +206,10 @@ fn definitions_references_blame_and_tree() {
         lines.push(def_line);
     }
     assert!(lines[1] > lines[0]);
+    // The snippet shows the whole function, through its closing brace.
+    let snippet = harness.state().peek.definition.as_ref().unwrap().snippet.as_ref().unwrap();
+    assert!(snippet.lines[0].contains("private function round"));
+    assert_eq!(snippet.lines.last().unwrap().trim(), "}");
     snapshot(&mut harness, "peek_definition");
 
     // `o` jumps to the definition: the cursor lands on that line of the new side.
@@ -664,6 +681,10 @@ fn tabs_bookmarks_and_preferences() {
     harness.state_mut().apply(Action::ShowBookmarks);
     wait_until(&mut harness, "highlighting", |app| app.hl_pending.is_empty());
     snapshot(&mut harness, "light_unified_bookmarks");
+    // As if the panel had been dragged taller.
+    harness.state_mut().prefs.peek_height = 410.0;
+    let store = Store::open(&tmp.path().join("settings.sqlite3")).unwrap();
+    harness.state().prefs.save(&store);
     drop(harness);
 
     // Restart: both tabs, the active one, and the preferences come back.
@@ -675,6 +696,30 @@ fn tabs_bookmarks_and_preferences() {
     assert_eq!(harness.state().tab_labels(), (vec!["shop".to_string(), "other".to_string()], 0));
     assert!(harness.state().unified);
     assert_eq!(harness.state().prefs.code_font, 16.0);
+    assert_eq!(harness.state().prefs.peek_height, 410.0);
+    // The panel opens at the remembered height.
+    harness.state_mut().apply(Action::ShowBookmarks);
+    harness.run_steps(3);
+    assert_eq!(harness.state().prefs.peek_height, 410.0, "not overwritten when the panel is shown");
+    let rect = harness.state().peek_rect;
+    assert!((rect.height() - 410.0).abs() < 2.0, "panel shown at {}", rect.height());
+
+    // Drag the panel's top edge up by 100 points: the new height is remembered.
+    let grab = egui::pos2(rect.center().x, rect.top());
+    harness.hover_at(grab);
+    harness.run_steps(1);
+    harness.event(egui::Event::PointerButton { pos: grab, button: egui::PointerButton::Primary, pressed: true, modifiers: Default::default() });
+    harness.run_steps(1);
+    for dy in [20.0, 60.0, 100.0] {
+        harness.hover_at(grab - egui::vec2(0.0, dy));
+        harness.run_steps(1);
+    }
+    harness.event(egui::Event::PointerButton { pos: grab - egui::vec2(0.0, 100.0), button: egui::PointerButton::Primary, pressed: false, modifiers: Default::default() });
+    harness.run_steps(2);
+    let height = harness.state().prefs.peek_height;
+    assert!((height - 510.0).abs() < 4.0, "dragged to {height}");
+    let saved = crate::state::Prefs::load(harness.state().store.as_ref()).peek_height;
+    assert!((saved - height).abs() < 1.0, "saved {saved}");
     harness.state_mut().apply(Action::CloseTab(0));
     assert_eq!(harness.state().tab_labels(), (vec!["other".to_string()], 0));
     assert_eq!(harness.state().rs.as_ref().unwrap().bookmarks.len(), 0, "bookmarks are per repository");
@@ -715,3 +760,4 @@ fn share_and_import_threads() {
     harness.state_mut().apply(Action::ImportThreads);
     assert_eq!(harness.state().rs.as_ref().unwrap().threads[0].comments.len(), 2);
 }
+

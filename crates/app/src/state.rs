@@ -654,6 +654,8 @@ pub struct Prefs {
     pub zoom: f32,
     /// Code font size in points (before zoom).
     pub code_font: f32,
+    /// Height of the peek panel, in points.
+    pub peek_height: f32,
 }
 
 pub struct PrefsDialog {

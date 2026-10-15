@@ -340,7 +340,21 @@ impl ReviewApp {
     pub(super) fn lsp_snippet(&self, target: &LspTarget) -> Option<Snippet> {
         let text = std::fs::read_to_string(&target.abs).ok()?;
         let first = target.line.saturating_sub(2);
-        let lines: Vec<String> = text.lines().skip(first as usize).take(32).map(|l| l.trim_end_matches('\r').to_string()).collect();
+        // The server only says where the definition starts; find its end by parsing the file,
+        // else show the rest of it.
+        let last = review_core::symbols::parse::parse_php(&text)
+            .symbols
+            .iter()
+            .filter(|s| s.first_line <= target.line && target.line <= s.last_line)
+            .min_by_key(|s| s.last_line - s.first_line)
+            .map(|s| s.last_line as usize);
+        let lines: Vec<String> = text
+            .lines()
+            .enumerate()
+            .skip(first as usize)
+            .take_while(|(i, _)| last.is_none_or(|l| *i <= l))
+            .map(|(_, l)| l.trim_end_matches('\r').to_string())
+            .collect();
         let path = target.abs.to_string_lossy().into_owned();
         let mut with_tag = vec!["<?php".to_string()];
         with_tag.extend(lines.iter().cloned());

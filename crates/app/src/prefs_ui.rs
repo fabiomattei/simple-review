@@ -10,6 +10,7 @@ use super::ReviewApp;
 use crate::state::{JobResult, PeekTab, Prefs, PrefsDialog, Side};
 
 pub const DEFAULT_CODE_FONT: f32 = 13.0;
+pub const DEFAULT_PEEK_HEIGHT: f32 = 260.0;
 
 impl Prefs {
     pub fn load(store: Option<&review_core::settings::Store>) -> Self {
@@ -22,6 +23,7 @@ impl Prefs {
             },
             zoom: get("zoom").and_then(|v| v.parse().ok()).unwrap_or(1.0),
             code_font: get("code_font").and_then(|v| v.parse().ok()).unwrap_or(DEFAULT_CODE_FONT),
+            peek_height: get("peek_height").and_then(|v| v.parse().ok()).unwrap_or(DEFAULT_PEEK_HEIGHT),
         }
     }
 
@@ -34,6 +36,7 @@ impl Prefs {
         let _ = store.set(GLOBAL, "theme", theme);
         let _ = store.set(GLOBAL, "zoom", &format!("{:.2}", self.zoom));
         let _ = store.set(GLOBAL, "code_font", &format!("{:.1}", self.code_font));
+        let _ = store.set(GLOBAL, "peek_height", &format!("{:.0}", self.peek_height));
     }
 }
 

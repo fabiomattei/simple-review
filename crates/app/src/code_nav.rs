@@ -13,8 +13,6 @@ use crate::state::{
     Side, Snippet, Version, ViewState,
 };
 
-/// Lines of a definition shown in the peek panel.
-const SNIPPET_LINES: u32 = 60;
 
 impl ReviewApp {
     /// The version (commit) and path shown on `side` of the current file.
@@ -205,7 +203,7 @@ impl ReviewApp {
         let Ok(bytes) = rs.repo.read_blob(file.id) else { return };
         let text = String::from_utf8_lossy(&bytes);
         let first = c.symbol.first_line;
-        let last = c.symbol.last_line.min(first + SNIPPET_LINES);
+        let last = c.symbol.last_line.max(first);
         let lines: Vec<String> = text
             .lines()
             .skip(first as usize)
