@@ -22,6 +22,8 @@ pub const SHORTCUTS: &[(&str, &str)] = &[
     ("Cmd/Ctrl+Enter", "Save a comment"),
     ("q", "Quality: secrets, new warnings, complexity, coverage"),
     ("v", "Toggle the coverage overlay"),
+    ("h", "History of the selected lines / function at the cursor"),
+    ("l", "Laravel: schema, packages and routes for this commit"),
     ("u", "Toggle split / unified view"),
     ("w", "Toggle ignore whitespace"),
     ("i", "Toggle word (intra-line) highlighting"),

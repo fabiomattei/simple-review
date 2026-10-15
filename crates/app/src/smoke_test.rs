@@ -486,3 +486,115 @@ fn quality_signals() {
         snapshot(&mut harness, "lsp_definition");
     }
 }
+
+#[test]
+fn history_bisect_and_laravel() {
+    use review_core::bisect::Verdict;
+    use review_core::laravel::risk::Risk;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let fx = fixture::build(&tmp.path().join("repo")).unwrap();
+    let id = |n: &str| parse_id(fx.commit(n)).unwrap();
+    let path = fx.path.clone();
+    let mut harness = Harness::builder()
+        .with_size(egui::vec2(1400.0, 900.0))
+        .wgpu()
+        .build_eframe(move |cc| {
+            cc.egui_ctx.set_visuals(egui::Visuals::dark());
+            ReviewApp::with_store(cc, Store::in_memory(), Some(path))
+        });
+    wait_until(&mut harness, "first diff", view_ready);
+
+    // Risk badges for the commits on screen.
+    wait_until(&mut harness, "risk flags", |app| app.risks.contains_key(&id("main_tz")));
+    assert_eq!(harness.state().risks[&id("main_tz")], vec![Risk::Config]);
+    assert!(harness.state().risks[&id("move")].is_empty());
+
+    // Pickaxe: when did `discount(` appear?
+    select_summary(&mut harness, "Add volume discount");
+    wait_until(&mut harness, "ai diff", |app| file_ready(app, "app/Services/InvoiceService.php"));
+    harness.state_mut().history_panel.query = "discount(".into();
+    harness.state_mut().apply(Action::PickaxeSearch);
+    wait_until(&mut harness, "pickaxe", |app| matches!(app.history_panel.pickaxe, Some((_, Ok(_)))));
+    {
+        let Some((_, Ok(hits))) = &harness.state().history_panel.pickaxe else { unreachable!() };
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].commit.id, id("ai"));
+    }
+
+    // History of the function at the cursor: discount() was born in this commit.
+    let (line, col) = line_of(harness.state(), Side::New, "return $sum > 100");
+    harness.state_mut().apply(Action::SetCursor(Cursor { side: Side::New, line, col }));
+    harness.key_press(Key::H);
+    wait_until(&mut harness, "line history", |app| matches!(app.history_panel.lines, Some((_, Ok(_)))));
+    {
+        let Some((label, Ok(result))) = &harness.state().history_panel.lines else { unreachable!() };
+        assert!(label.contains("app/Services/InvoiceService.php"), "{label}");
+        let origin = result.origin.as_ref().unwrap();
+        assert_eq!(origin.id, id("ai"));
+        assert!(origin.ai_assisted);
+        assert!(result.steps.iter().any(|(_, c)| c.id == id("ai")));
+    }
+    wait_until(&mut harness, "highlighting", |app| app.hl_pending.is_empty());
+    snapshot(&mut harness, "history_tab");
+
+    // Bisect between `initial` (good) and `crlf` (bad), with `ai` as the culprit.
+    let repo = review_core::git::Repo::open(&fx.path).unwrap();
+    let is_bad = |c: review_core::ObjectId| {
+        let mut found = false;
+        repo.walk_commits(c, |info| {
+            found |= info.id == id("ai");
+            if found { std::ops::ControlFlow::Break(()) } else { std::ops::ControlFlow::Continue(()) }
+        })
+        .unwrap();
+        found
+    };
+    harness.state_mut().apply(Action::OpenCommit { id: id("crlf"), path: None });
+    harness.state_mut().apply(Action::BisectMark(crate::ui::BisectMark::Bad));
+    harness.state_mut().apply(Action::OpenCommit { id: id("initial"), path: None });
+    harness.state_mut().apply(Action::BisectMark(crate::ui::BisectMark::Good));
+    for _ in 0..8 {
+        match harness.state().bisect_verdict.clone() {
+            Some(Ok(Verdict::Next { commit, .. })) => {
+                harness.state_mut().apply(Action::BisectGo);
+                harness.run_steps(1);
+                let mark = if is_bad(commit) { crate::ui::BisectMark::Bad } else { crate::ui::BisectMark::Good };
+                harness.state_mut().apply(Action::BisectMark(mark));
+            }
+            Some(Ok(Verdict::Found(c))) => {
+                assert_eq!(c, id("ai"));
+                break;
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+    assert!(matches!(harness.state().bisect_verdict, Some(Ok(Verdict::Found(_)))));
+    snapshot(&mut harness, "bisect");
+    harness.state_mut().apply(Action::BisectReset);
+
+    // Laravel views on the `laravel` branch.
+    harness.state_mut().apply(Action::OpenCommit { id: id("laravel_change"), path: None });
+    harness.state_mut().apply(Action::LaravelTab(crate::state::LaravelTab::Schema));
+    let key = (Some(id("laravel_base")), id("laravel_change"));
+    wait_until(&mut harness, "laravel data", |app| matches!(app.laravel.data.get(&key), Some(Ok(_))));
+    {
+        let Some(Ok(data)) = harness.state().laravel.data.get(&key) else { unreachable!() };
+        assert_eq!(data.schema_changes.len(), 1);
+        assert_eq!(data.route_changes.len(), 2);
+        assert_eq!(data.packages.as_ref().map(Vec::len), Some(4));
+    }
+    snapshot(&mut harness, "laravel_schema");
+    harness.state_mut().apply(Action::LaravelTab(crate::state::LaravelTab::Routes));
+    // composer.lock is the first changed file and stays collapsed; wait for the index instead.
+    wait_until(&mut harness, "symbol index", |app| app.index_jobs.is_empty());
+    harness.run_steps(2);
+    snapshot(&mut harness, "laravel_routes");
+    // The first route (GET api/invoices) opens InvoiceController::index.
+    harness.state_mut().apply(Action::OpenRoute(0));
+    wait_until(&mut harness, "controller", |app| {
+        view_ready(app) && current_path(app).as_deref() == Some("app/Http/Controllers/InvoiceController.php")
+    });
+    let cursor = harness.state().rs.as_ref().unwrap().commit.as_ref().unwrap().file.as_ref().unwrap().cursor.unwrap();
+    let (index_line, _) = line_of(harness.state(), Side::New, "function index");
+    assert_eq!(cursor.line, index_line);
+}

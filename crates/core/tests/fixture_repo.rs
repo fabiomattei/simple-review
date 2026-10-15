@@ -507,3 +507,144 @@ printf '},"errors":[]}'
         client.shutdown();
     }
 }
+
+mod phase5 {
+    use super::*;
+    use review_core::bisect::{Bisect, Verdict};
+    use review_core::history::{self, Direction};
+    use review_core::laravel::composer::{self, PackageChange};
+    use review_core::laravel::risk::{self, Risk};
+    use review_core::laravel::routes::{self, RouteChange};
+    use review_core::laravel::schema::{self, TableChange};
+
+    #[test]
+    fn risk_flags() {
+        let (_dir, fx, repo) = setup();
+        let paths = |name: &str| changes(&repo, &fx, name).iter().map(|c| c.path().to_string()).collect::<Vec<_>>();
+        let r = |name: &str| risk::risks(paths(name).iter().map(String::as_str));
+        assert_eq!(r("laravel_change"), vec![Risk::Migration, Risk::Routes, Risk::Dependencies]);
+        assert_eq!(r("main_tz"), vec![Risk::Config]);
+        assert_eq!(r("leak_secret"), vec![Risk::Config, Risk::EnvExample]);
+        assert!(r("move").is_empty());
+    }
+
+    #[test]
+    fn schema_at_commits() {
+        let (_dir, fx, repo) = setup();
+        let c = commit(&repo, &fx, "laravel_change");
+        let (old, new) = (schema::schema_at(&repo, c.parents[0]).unwrap(), schema::schema_at(&repo, c.id).unwrap());
+        assert_eq!(old.tables.keys().collect::<Vec<_>>(), vec!["invoices", "users"]);
+        assert_eq!(old.tables["invoices"].column("user_id").unwrap().modifiers, vec!["→ users.id"]);
+        let changes = schema::diff(&old, &new);
+        assert_eq!(changes.len(), 1);
+        let TableChange::Altered { table, added, removed, .. } = &changes[0] else { panic!() };
+        assert_eq!(table, "invoices");
+        assert_eq!(added.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(), vec!["amount", "status"]);
+        assert_eq!(removed[0].name, "total");
+        // Before any migrations existed.
+        assert!(schema::schema_at(&repo, parse_id(fx.commit("crlf")).unwrap()).unwrap().tables.is_empty());
+    }
+
+    #[test]
+    fn dependency_changes() {
+        let (_dir, fx, repo) = setup();
+        let c = commit(&repo, &fx, "laravel_change");
+        let lock = |id| composer::parse_lock(&String::from_utf8(repo.read_blob(repo.find_file(id, "composer.lock").unwrap().unwrap().id).unwrap()).unwrap()).unwrap();
+        let d = composer::diff_lock(&lock(c.parents[0]), &lock(c.id));
+        let summary: Vec<String> = d
+            .iter()
+            .map(|p| match p {
+                PackageChange::Added { name, .. } => format!("+{name}"),
+                PackageChange::Removed { name, .. } => format!("-{name}"),
+                PackageChange::Changed { name, major, .. } => format!("{name}{}", if *major { " (major)" } else { "" }),
+            })
+            .collect();
+        assert_eq!(summary, vec!["guzzlehttp/guzzle", "laravel/framework (major)", "+spatie/laravel-data", "-spatie/old-package"]);
+    }
+
+    #[test]
+    fn route_changes_and_links() {
+        let (_dir, fx, repo) = setup();
+        let c = commit(&repo, &fx, "laravel_change");
+        let (old, new) = (routes::routes_at(&repo, c.parents[0]).unwrap(), routes::routes_at(&repo, c.id).unwrap());
+        assert_eq!(old.iter().map(|r| r.key()).collect::<Vec<_>>(), vec!["GET api/invoices", "GET api/invoices/{invoice}", "POST api/invoices/{invoice}/send", "GET users", "GET users/{user}"]);
+        assert_eq!(old[3].action.label(), "AccountController@index");
+        assert_eq!(old[3].middleware, vec!["web"]);
+        assert_eq!(old[0].middleware, vec!["api", "auth:sanctum"]);
+        let d = routes::diff(&old, &new);
+        let kinds: Vec<String> = d
+            .iter()
+            .map(|c| match c {
+                RouteChange::Added(r) => format!("+{}", r.key()),
+                RouteChange::Removed(r) => format!("-{}", r.key()),
+                RouteChange::Changed { new, .. } => format!("~{} {}", new.key(), new.name.clone().unwrap_or_default()),
+            })
+            .collect();
+        assert_eq!(kinds, vec!["+DELETE api/invoices/{invoice}", "~POST api/invoices/{invoice}/send invoices.deliver"]);
+
+        // Route → controller method, class → tests.
+        let index = review_core::symbols::SymbolIndex::build(&repo, c.id, &|_| true, &Default::default(), &|_| {}, &|| false).unwrap().unwrap();
+        let routes::RouteAction::Controller { class, method } = &new[0].action else { panic!() };
+        assert_eq!(class, "App\\Http\\Controllers\\InvoiceController");
+        let file = index.file("app/Http/Controllers/InvoiceController.php").unwrap();
+        assert!(file.symbols.iter().any(|s| s.fqn == format!("{class}::{method}")));
+        let tree: Vec<String> = repo.list_files(c.id).unwrap().into_iter().map(|f| f.path).collect();
+        assert_eq!(routes::tests_for_class(class, tree.iter().map(String::as_str)), vec!["tests/Feature/InvoiceControllerTest.php"]);
+    }
+
+    #[test]
+    fn pickaxe_and_line_history() {
+        let (_dir, fx, repo) = setup();
+        let head = repo.head_id().unwrap().unwrap();
+        let hits = history::pickaxe(&repo, head, "discount(", false, None, 50).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].commit.id.to_string(), fx.commit("ai"));
+        assert_eq!(hits[0].files, vec![("app/Services/InvoiceService.php".to_string(), Direction::Added)]);
+        let tz = history::pickaxe(&repo, head, "Europe/[A-Z][a-z]+", true, Some("config/app.php"), 50).unwrap();
+        assert!(tz.len() >= 2, "{}", tz.len());
+        assert!(history::pickaxe(&repo, head, "(", true, None, 5).is_err());
+
+        let text = String::from_utf8(repo.read_blob(repo.find_file(head, "app/Services/InvoiceService.php").unwrap().unwrap().id).unwrap()).unwrap();
+        let line = text.lines().position(|l| l.contains("$sum > 100")).unwrap() as u32;
+        let steps = history::line_history(&repo, head, "app/Services/InvoiceService.php", line, line).unwrap();
+        assert_eq!(steps.last().unwrap().commit.to_string(), fx.commit("ai"));
+        let origin = history::original_author(&repo, head, "app/Services/InvoiceService.php", line, line).unwrap().unwrap();
+        assert!(origin.ai_assisted);
+        // A line that was there from the start, through the rename and the move.
+        let line = text.lines().position(|l| l.contains("foreach ($lines as $line)")).unwrap() as u32;
+        let steps = history::line_history(&repo, head, "app/Services/InvoiceService.php", line, line).unwrap();
+        assert_eq!(steps.last().unwrap().commit.to_string(), fx.commit("invoice"));
+    }
+
+    #[test]
+    fn bisect_narrows_to_the_culprit() {
+        let (_dir, fx, repo) = setup();
+        let id = |n: &str| parse_id(fx.commit(n)).unwrap();
+        // Pretend "ai" broke something: good up to its parent, bad from it on.
+        let culprit = id("ai");
+        let is_bad = |c: review_core::ObjectId| {
+            let mut found = false;
+            repo.walk_commits(c, |info| {
+                found |= info.id == culprit;
+                if found { ControlFlow::Break(()) } else { ControlFlow::Continue(()) }
+            })
+            .unwrap();
+            found
+        };
+        let mut b = Bisect { bad: Some(id("crlf")), good: vec![id("initial")], ..Default::default() };
+        let mut steps = 0;
+        let found = loop {
+            match b.verdict(&repo).unwrap() {
+                Verdict::Next { commit, .. } => {
+                    if is_bad(commit) { b.bad = Some(commit) } else { b.good.push(commit) }
+                }
+                Verdict::Found(c) => break c,
+                v => panic!("{v:?}"),
+            }
+            steps += 1;
+            assert!(steps < 10);
+        };
+        assert_eq!(found, culprit);
+        assert!(steps <= 5, "{steps} steps");
+    }
+}

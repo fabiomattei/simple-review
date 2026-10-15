@@ -109,6 +109,77 @@ pub enum JobResult {
         request: u64,
         result: Result<Vec<LspTarget>, String>,
     },
+    Risks(Vec<(ObjectId, Vec<review_core::laravel::risk::Risk>)>),
+    Pickaxe {
+        query: String,
+        result: Result<Vec<review_core::history::PickaxeHit>, String>,
+    },
+    LineHistory {
+        label: String,
+        result: Result<LineHistoryResult, String>,
+    },
+    Laravel {
+        key: AnalysisKey,
+        result: Result<LaravelData, String>,
+    },
+    Advisories {
+        key: AnalysisKey,
+        result: Result<Vec<review_core::laravel::composer::Advisory>, String>,
+    },
+    ArtisanRoutes {
+        key: AnalysisKey,
+        result: Result<Vec<review_core::laravel::routes::RouteChange>, String>,
+    },
+}
+
+/// Laravel views for one diff (old → new).
+#[derive(Debug, Clone, Default)]
+pub struct LaravelData {
+    pub schema_changes: Vec<review_core::laravel::schema::TableChange>,
+    pub schema: review_core::laravel::schema::Schema,
+    /// `None` when composer.lock didn't change.
+    pub packages: Option<Vec<review_core::laravel::composer::PackageChange>>,
+    pub route_changes: Vec<review_core::laravel::routes::RouteChange>,
+    pub routes: Vec<review_core::laravel::routes::RouteDef>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum LaravelTab {
+    #[default]
+    Schema,
+    Packages,
+    Routes,
+}
+
+/// Commits that changed a line range, and who first wrote its first line.
+#[derive(Debug, Clone)]
+pub struct LineHistoryResult {
+    pub steps: Vec<(review_core::history::LineStep, CommitInfo)>,
+    pub origin: Option<CommitInfo>,
+}
+
+/// A background result: `Err(None)` while running, `Err(Some(message))` on failure.
+pub type Pending<T> = Result<T, Option<String>>;
+
+/// State of the History tab.
+#[derive(Default)]
+pub struct HistoryPanel {
+    pub query: String,
+    pub regex: bool,
+    pub this_file: bool,
+    /// The query that produced `pickaxe`, and the results; `Err(None)` while running.
+    pub pickaxe: Option<(String, Pending<Vec<review_core::history::PickaxeHit>>)>,
+    pub lines: Option<(String, Pending<LineHistoryResult>)>,
+}
+
+/// State of the Laravel tab for the selected diff.
+#[derive(Default)]
+pub struct LaravelPanel {
+    pub tab: LaravelTab,
+    pub data: std::collections::HashMap<AnalysisKey, Result<LaravelData, Option<String>>>,
+    pub advisories: std::collections::HashMap<AnalysisKey, Result<Vec<review_core::laravel::composer::Advisory>, Option<String>>>,
+    pub artisan: std::collections::HashMap<AnalysisKey, Result<Vec<review_core::laravel::routes::RouteChange>, Option<String>>>,
+    pub route_filter: String,
 }
 
 /// Old and new commit of a diff: what analysis results are cached under.
@@ -225,6 +296,8 @@ pub struct SelectedCommit {
     pub tree: Option<Result<Vec<TreeFile>, String>>,
     /// Whole file to open once the file list arrives (history navigation).
     pub pending_browse: Option<(ObjectId, String)>,
+    /// Line to reveal in the file opened from `pending_path`.
+    pub pending_line: Option<(Side, u32)>,
 }
 
 impl SelectedCommit {
@@ -411,6 +484,8 @@ pub enum PeekTab {
     Blame,
     Comments,
     Quality,
+    History,
+    Laravel,
 }
 
 /// A version of the code: the commit whose tree a lookup runs against.

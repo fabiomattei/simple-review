@@ -70,6 +70,12 @@ pub struct ReviewApp {
     coverage_on: bool,
     lsp_servers: Arc<std::sync::Mutex<HashMap<ObjectId, review_core::lsp::LspClient>>>,
     lsp_counter: u64,
+    risks: HashMap<ObjectId, Vec<review_core::laravel::risk::Risk>>,
+    risk_pending: HashSet<ObjectId>,
+    history_panel: crate::state::HistoryPanel,
+    bisect: review_core::bisect::Bisect,
+    bisect_verdict: Option<Result<review_core::bisect::Verdict, String>>,
+    laravel: crate::state::LaravelPanel,
 }
 
 impl ReviewApp {
@@ -137,6 +143,12 @@ impl ReviewApp {
             coverage_on,
             lsp_servers: Arc::default(),
             lsp_counter: 0,
+            risks: HashMap::new(),
+            risk_pending: HashSet::new(),
+            history_panel: Default::default(),
+            bisect: Default::default(),
+            bisect_verdict: None,
+            laravel: Default::default(),
         };
         if let Some(path) = initial {
             app.open_repo(&path);
@@ -224,6 +236,12 @@ impl ReviewApp {
         self.secret_scans.clear();
         self.secret_pending.clear();
         self.load_coverage();
+        self.risks.clear();
+        self.risk_pending.clear();
+        self.history_panel = Default::default();
+        self.bisect = Default::default();
+        self.bisect_verdict = None;
+        self.laravel = Default::default();
     }
 
     fn select_commit(&mut self, info: CommitInfo, parent_idx: usize, path: Option<String>, push: bool) {
@@ -259,6 +277,7 @@ impl ReviewApp {
             reveal_file: true,
             tree: None,
             pending_browse: None,
+            pending_line: None,
         };
         sc.reviewed = self.store.as_ref().and_then(|s| s.reviewed_files(rs.repo.root(), &sc.review_key()).ok()).unwrap_or_default();
         let (commit, parent) = (sc.info.id, sc.parent());
@@ -301,6 +320,7 @@ impl ReviewApp {
         }
         let path = change.path().to_string();
         let mut sf = SelectedFile::new(index, change, target);
+        sf.pending_line = sc.pending_line.take();
         if rs.settings.is_ignored(&path) {
             sf.view = ViewState::Collapsed("ignored path");
         } else if is_generated(&path) {
@@ -445,6 +465,31 @@ impl ReviewApp {
                     self.secret_scans.insert(key, findings);
                 }
                 JobResult::LspDefinition { request, result } => self.on_lsp_definition(request, result),
+                JobResult::Risks(found) => {
+                    for (id, r) in found {
+                        self.risk_pending.remove(&id);
+                        self.risks.insert(id, r);
+                    }
+                }
+                JobResult::Pickaxe { query, result } => {
+                    if self.history_panel.pickaxe.as_ref().is_some_and(|(q, _)| *q == query) {
+                        self.history_panel.pickaxe = Some((query, result.map_err(Some)));
+                    }
+                }
+                JobResult::LineHistory { label, result } => {
+                    if self.history_panel.lines.as_ref().is_some_and(|(l, _)| *l == label) {
+                        self.history_panel.lines = Some((label, result.map_err(Some)));
+                    }
+                }
+                JobResult::Laravel { key, result } => {
+                    self.laravel.data.insert(key, result.map_err(Some));
+                }
+                JobResult::Advisories { key, result } => {
+                    self.laravel.advisories.insert(key, result.map_err(Some));
+                }
+                JobResult::ArtisanRoutes { key, result } => {
+                    self.laravel.artisan.insert(key, result.map_err(Some));
+                }
                 JobResult::LspReferences { request, result } => self.on_lsp_references(request, result),
                 JobResult::Tree { commit, result } => {
                     if let Some(sc) = self.rs.as_mut().and_then(|rs| rs.commit.as_mut())
@@ -461,6 +506,7 @@ impl ReviewApp {
         self.ensure_placed();
         self.ensure_file_quality();
         self.ensure_secret_scan();
+        self.ensure_laravel();
         if self.toast.as_ref().is_some_and(|(_, at)| at.elapsed() > Duration::from_secs(6)) {
             self.toast = None;
         }
@@ -687,6 +733,30 @@ impl ReviewApp {
             Action::OpenReference(i) => self.open_reference(i),
             Action::ClosePeek => self.peek.open = false,
             Action::GoToLine { path, line } => self.go_to_changed_line(&path, line),
+            Action::ComputeRisks(ids) => self.compute_risks(ids),
+            Action::PickaxeSearch => {
+                self.peek.open = true;
+                self.peek.tab = crate::state::PeekTab::History;
+                self.pickaxe_search();
+            }
+            Action::LineHistory => self.line_history(),
+            Action::OpenPickaxeHit { commit, path } => self.select_commit_by_id(commit, 0, Some(path), true),
+            Action::OpenHistoryStep(i) => self.open_history_step(i),
+            Action::BisectMark(m) => self.bisect_mark(m),
+            Action::BisectReset => {
+                self.bisect = Default::default();
+                self.bisect_verdict = None;
+            }
+            Action::BisectGo => self.bisect_go(),
+            Action::LaravelTab(t) => {
+                self.peek.open = true;
+                self.peek.tab = crate::state::PeekTab::Laravel;
+                self.laravel.tab = t;
+            }
+            Action::CheckAdvisories => self.check_advisories(),
+            Action::ArtisanRoutes => self.artisan_routes(),
+            Action::OpenRoute(i) => self.open_route_action(i),
+            Action::OpenTestsFor(class) => self.open_tests_for(&class),
             Action::RunAnalysis => self.run_analysis(),
             Action::ShowQuality => self.show_quality(),
             Action::ToggleCoverage => {
@@ -869,6 +939,8 @@ impl ReviewApp {
                 (Key::C, Action::StartComment),
                 (Key::V, Action::ToggleCoverage),
                 (Key::Q, Action::ShowQuality),
+                (Key::H, Action::LineHistory),
+                (Key::L, Action::LaravelTab(self.laravel.tab)),
                 (Key::Period, Action::NextThread),
                 (Key::Comma, Action::PrevThread),
                 (Key::F5, Action::Reload),
@@ -1000,6 +1072,9 @@ impl ReviewApp {
             .and_then(|sc| self.secret_scans.get(&(sc.parent(), sc.info.id)))
             .map_or(0, Vec::len);
         let coverage_on = self.coverage_on;
+        let laravel_key = self.rs.as_ref().and_then(|rs| rs.commit.as_ref()).map(|sc| (sc.parent(), sc.info.id));
+        let trusted = self.trusted();
+        let bisect_verdict = self.bisect_verdict.clone();
         let comments = (self.peek.open && self.peek.tab == crate::state::PeekTab::Comments).then(|| self.comments_view());
         if comments.is_some() {
             self.peek.reveal_thread = false;
@@ -1020,6 +1095,9 @@ impl ReviewApp {
             return;
         };
         ui::header::commit_details(ui, sc, range_label.as_deref(), actions);
+        if let Some(verdict) = &bisect_verdict {
+            ui::header::bisect_bar(ui, verdict, actions);
+        }
         if secret_count > 0
             && ui
                 .button(RichText::new(format!("⚠ This commit adds {secret_count} possible secret(s): show")).color(ui::palette(ui).warn))
@@ -1067,7 +1145,17 @@ impl ReviewApp {
                 .resizable(true)
                 .default_size(260.0)
                 .min_size(120.0)
-                .show(ui, |ui| ui::peek::show(ui, &self.peek, &info, comments.as_ref(), quality.as_ref(), actions));
+                .show(ui, |ui| {
+                    let has_file = true;
+                    let laravel_view = laravel_key.map(|k| ui::laravel::LaravelView {
+                        data: self.laravel.data.get(&k),
+                        advisories: self.laravel.advisories.get(&k),
+                        artisan: self.laravel.artisan.get(&k),
+                        trusted,
+                    });
+                    let laravel = laravel_view.map(|v| (self.laravel.tab, &mut self.laravel.route_filter, v));
+                    ui::peek::show(ui, &self.peek, &info, comments.as_ref(), quality.as_ref(), Some((&mut self.history_panel, has_file)), laravel, actions)
+                });
         }
 
         let message = |ui: &mut Ui, text: String, button: Option<&str>, actions: &mut Vec<Action>| {
@@ -1192,7 +1280,9 @@ fn request_view(
     sf.key = Some(key.clone());
     if let Some(view) = cache.get(&key) {
         sf.set_view(view);
-        sf.reveal_current_hunk(false);
+        if !sf.apply_pending_line(false) {
+            sf.reveal_current_hunk(false);
+        }
         return;
     }
     sf.view = ViewState::Loading;
@@ -1237,6 +1327,7 @@ impl eframe::App for ReviewApp {
         egui::Panel::bottom("status").show(ui, |ui| self.status_bar(ui));
 
         let show_all = self.show_all_files;
+        let bisect = self.bisect_marks();
         if let Some(rs) = self.rs.as_mut() {
             egui::Panel::left("sidebar").default_size(400.0).min_size(260.0).show(ui, |ui| {
                 if let Some(sc) = rs.commit.as_mut() {
@@ -1247,7 +1338,9 @@ impl eframe::App for ReviewApp {
                         .min_size(120.0)
                         .show(ui, |ui| ui::files::show(ui, sc, settings, show_all, &mut self.file_filter, &mut actions));
                 }
-                ui::commits::show(ui, rs, &mut actions);
+                let (good, bad, skip) = (bisect.0.clone(), bisect.1, bisect.2.clone());
+                let marks = ui::commits::Marks { risks: &self.risks, good, bad, skip };
+                ui::commits::show(ui, rs, &marks, &mut actions);
             });
         }
         egui::CentralPanel::default().show(ui, |ui| self.central(ui, &mut actions));
@@ -1276,6 +1369,9 @@ mod review_ui;
 
 #[path = "quality_ui.rs"]
 mod quality_ui;
+
+#[path = "history_ui.rs"]
+mod history_ui;
 
 #[cfg(test)]
 #[path = "smoke_test.rs"]

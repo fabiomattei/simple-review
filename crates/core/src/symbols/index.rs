@@ -133,6 +133,11 @@ impl SymbolIndex {
         self.files.get(path).map(Arc::as_ref)
     }
 
+    /// All indexed files with their symbols.
+    pub fn files(&self) -> impl Iterator<Item = (&String, &FileSymbols)> {
+        self.files.iter().map(|(p, f)| (p, f.as_ref()))
+    }
+
     pub fn file_count(&self) -> usize {
         self.files.len()
     }

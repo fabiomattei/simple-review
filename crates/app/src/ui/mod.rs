@@ -7,6 +7,8 @@ pub mod diff;
 pub mod files;
 pub mod header;
 pub mod help;
+pub mod history;
+pub mod laravel;
 pub mod markdown;
 pub mod peek;
 pub mod quality;
@@ -23,6 +25,19 @@ use crate::state::{CommentScope, Cursor, PeekTab, StatusFilter};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Action {
+    ComputeRisks(Vec<ObjectId>),
+    PickaxeSearch,
+    LineHistory,
+    OpenPickaxeHit { commit: ObjectId, path: String },
+    OpenHistoryStep(usize),
+    BisectMark(BisectMark),
+    BisectReset,
+    BisectGo,
+    LaravelTab(crate::state::LaravelTab),
+    CheckAdvisories,
+    ArtisanRoutes,
+    OpenRoute(usize),
+    OpenTestsFor(String),
     GoToLine { path: String, line: u32 },
     RunAnalysis,
     ToggleCoverage,
@@ -88,6 +103,13 @@ pub enum Action {
     ExpandFile,
     ToggleHelp,
     LoadMoreCommits,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BisectMark {
+    Good,
+    Bad,
+    Skip,
 }
 
 /// Colours that depend on the light/dark theme.

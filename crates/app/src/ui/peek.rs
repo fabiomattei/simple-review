@@ -18,12 +18,15 @@ pub struct BlameInfo<'a> {
     pub error: Option<&'a str>,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn show(
     ui: &mut Ui,
     peek: &Peek,
     blame: &BlameInfo<'_>,
     comments: Option<&CommentsView>,
     quality: Option<&super::quality::QualityView>,
+    history: Option<(&mut crate::state::HistoryPanel, bool)>,
+    laravel: Option<(crate::state::LaravelTab, &mut String, super::laravel::LaravelView<'_>)>,
     actions: &mut Vec<Action>,
 ) {
     ui.horizontal(|ui| {
@@ -33,6 +36,8 @@ pub fn show(
             (PeekTab::Blame, "Blame", "Line history for the cursor line"),
             (PeekTab::Comments, "Comments", "Review comments (c to add, . and , to step)"),
             (PeekTab::Quality, "Quality", "New warnings, secrets, complexity, coverage (q)"),
+            (PeekTab::History, "History", "When did text appear? History of lines (h)"),
+            (PeekTab::Laravel, "Laravel", "Schema, packages and routes for this commit (l)"),
         ] {
             if ui.selectable_label(peek.tab == tab, label).on_hover_text(hint).clicked() {
                 actions.push(Action::PeekTab(tab));
@@ -49,6 +54,18 @@ pub fn show(
         PeekTab::Definition => definition(ui, peek, actions),
         PeekTab::References => references(ui, peek, actions),
         PeekTab::Blame => blame_tab(ui, blame, actions),
+        PeekTab::History => match history {
+            Some((h, has_file)) => super::history::show(ui, h, has_file, actions),
+            None => {
+                ui.weak("Open a repository.");
+            }
+        },
+        PeekTab::Laravel => match laravel {
+            Some((tab, filter, view)) => super::laravel::show(ui, tab, filter, &view, actions),
+            None => {
+                ui.weak("Select a commit.");
+            }
+        },
         PeekTab::Quality => match quality {
             Some(view) => super::quality::show(ui, view, actions),
             None => {

@@ -19,7 +19,7 @@ pub struct Fixture {
 impl Fixture {
     /// Commits reachable from `main` (the `topic_*` ones are on an unmerged branch).
     pub fn main_commit_count(&self) -> usize {
-        self.commits.keys().filter(|k| !k.starts_with("topic") && !k.starts_with("leak")).count()
+        self.commits.keys().filter(|k| !["topic", "leak", "laravel"].iter().any(|p| k.starts_with(p))).count()
     }
 
     pub fn commit(&self, name: &str) -> &str {
@@ -198,6 +198,101 @@ class InvoiceService
 }
 "#;
 
+const MIGRATION_USERS: &str = r#"<?php
+
+use Illuminate\Database\Migrations\Migration;
+use Illuminate\Database\Schema\Blueprint;
+use Illuminate\Support\Facades\Schema;
+
+return new class extends Migration
+{
+    public function up(): void
+    {
+        Schema::create('users', function (Blueprint $table) {
+            $table->id();
+            $table->string('name');
+            $table->string('email')->unique();
+            $table->timestamps();
+        });
+    }
+
+    public function down(): void
+    {
+        Schema::dropIfExists('users');
+    }
+};
+"#;
+
+const MIGRATION_INVOICES: &str = r#"<?php
+
+use Illuminate\Database\Migrations\Migration;
+use Illuminate\Database\Schema\Blueprint;
+use Illuminate\Support\Facades\Schema;
+
+return new class extends Migration
+{
+    public function up(): void
+    {
+        Schema::create('invoices', function (Blueprint $table) {
+            $table->id();
+            $table->foreignId('user_id')->constrained();
+            $table->decimal('total', 8, 2);
+            $table->timestamps();
+        });
+    }
+};
+"#;
+
+const MIGRATION_STATUS: &str = r#"<?php
+
+use Illuminate\Database\Migrations\Migration;
+use Illuminate\Database\Schema\Blueprint;
+use Illuminate\Support\Facades\Schema;
+
+return new class extends Migration
+{
+    public function up(): void
+    {
+        Schema::table('invoices', function (Blueprint $table) {
+            $table->string('status')->default('draft');
+            $table->renameColumn('total', 'amount');
+        });
+    }
+};
+"#;
+
+const ROUTES_API: &str = r#"<?php
+
+use App\Http\Controllers\InvoiceController;
+use Illuminate\Support\Facades\Route;
+
+Route::middleware('auth:sanctum')->group(function () {
+    Route::apiResource('invoices', InvoiceController::class)->only(['index', 'show']);
+    Route::post('invoices/{invoice}/send', [InvoiceController::class, 'send'])->name('invoices.send');
+});
+"#;
+
+const INVOICE_CONTROLLER: &str = r#"<?php
+
+namespace App\Http\Controllers;
+
+class InvoiceController extends Controller
+{
+    public function index() {}
+
+    public function show($invoice) {}
+
+    public function send($invoice) {}
+
+    public function destroy($invoice) {}
+}
+"#;
+
+fn composer_lock(packages: &[(&str, &str)]) -> String {
+    let list: Vec<String> = packages.iter().map(|(n, v)| format!("        {{\"name\": \"{n}\", \"version\": \"{v}\"}}")).collect();
+    format!("{{\n    \"packages\": [\n{}\n    ],\n    \"packages-dev\": []\n}}\n", list.join(",\n"))
+}
+
 fn config(timezone: &str) -> String {
     format!("<?php\n\nreturn [\n    'name' => env('APP_NAME', 'Laravel'),\n    'timezone' => '{timezone}',\n    'locale' => 'en',\n];\n")
 }
@@ -212,7 +307,9 @@ const ROUTES: &str = "<?php\n\nuse Illuminate\\Support\\Facades\\Route;\n\nRoute
 /// `delete` (removes a file), `old_laptop` (identity merged by `.mailmap`), `rebased` (author ≠ committer), `ai` (Co-Authored-By: Claude),
 /// `main_tz`, then `feature_tz` on a branch, `merge` (conflict resolved by hand), `crlf`.
 /// Branch `topic` (unmerged, off `crlf`): `topic_discount`, `topic_test`.
-/// Branch `leak` (off `crlf`): `leak_secret` adds a Stripe key and an AWS key. HEAD is `main`.
+/// Branch `leak` (off `crlf`): `leak_secret` adds a Stripe key and an AWS key.
+/// Branch `laravel` (off `crlf`): `laravel_base` (migrations, composer.lock, API routes),
+/// `laravel_change` (alter migration, framework upgrade, route changes). HEAD is `main`.
 pub fn build(dir: &Path) -> Result<Fixture> {
     std::fs::create_dir_all(dir)?;
     if std::fs::read_dir(dir)?.next().is_some() {
@@ -317,6 +414,21 @@ pub fn build(dir: &Path) -> Result<Fixture> {
     )?;
     b.write(".env.example", "APP_NAME=Shop\nAWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLQ\nDB_PASSWORD=\n")?;
     commits.insert("leak_secret", b.commit("Configure payments", BOB, BOB)?);
+    b.git(&["checkout", "-q", "main"], ALICE, ALICE)?;
+
+    // Laravel-shaped changes: migrations, composer.lock and routes.
+    b.git(&["checkout", "-q", "-b", "laravel", commits["crlf"].as_str()], ALICE, ALICE)?;
+    b.write("database/migrations/2024_01_01_000000_create_users_table.php", MIGRATION_USERS)?;
+    b.write("database/migrations/2024_01_02_000000_create_invoices_table.php", MIGRATION_INVOICES)?;
+    b.write("composer.lock", composer_lock(&[("laravel/framework", "v11.9.0"), ("guzzlehttp/guzzle", "7.8.1"), ("spatie/old-package", "1.2.0")]))?;
+    b.write("routes/api.php", ROUTES_API)?;
+    b.write("app/Http/Controllers/InvoiceController.php", INVOICE_CONTROLLER)?;
+    b.write("tests/Feature/InvoiceControllerTest.php", "<?php\n\nnamespace Tests\\Feature;\n\nclass InvoiceControllerTest extends TestCase\n{\n}\n")?;
+    commits.insert("laravel_base", b.commit("Add invoices API", ALICE, ALICE)?);
+    b.write("database/migrations/2024_02_01_000000_add_status_to_invoices.php", MIGRATION_STATUS)?;
+    b.write("composer.lock", composer_lock(&[("laravel/framework", "v12.1.0"), ("guzzlehttp/guzzle", "7.9.2"), ("spatie/laravel-data", "4.0.0")]))?;
+    b.write("routes/api.php", ROUTES_API.replace("->name('invoices.send')", "->name('invoices.deliver')").replace("});\n", "    Route::delete('invoices/{invoice}', [InvoiceController::class, 'destroy']);\n});\n"))?;
+    commits.insert("laravel_change", b.commit("Track invoice status, upgrade Laravel", ALICE, ALICE)?);
     b.git(&["checkout", "-q", "main"], ALICE, ALICE)?;
 
     Ok(Fixture { path: dir.to_path_buf(), commits })

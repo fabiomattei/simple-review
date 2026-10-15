@@ -69,6 +69,25 @@ pub fn toolbar(ui: &mut Ui, s: &ToolbarState<'_>, actions: &mut Vec<Action>) {
                     ui.close();
                 }
             });
+            ui.menu_button("Bisect", |ui| {
+                ui.weak("Mark the selected commit:");
+                for (mark, label) in [
+                    (super::BisectMark::Bad, "Bad (has the problem)"),
+                    (super::BisectMark::Good, "Good (before the problem)"),
+                    (super::BisectMark::Skip, "Skip (can't test)"),
+                ] {
+                    if ui.button(label).clicked() {
+                        actions.push(Action::BisectMark(mark));
+                        ui.close();
+                    }
+                }
+                ui.separator();
+                if ui.button("Reset bisect").clicked() {
+                    actions.push(Action::BisectReset);
+                    ui.close();
+                }
+                ui.weak("Nothing is checked out; test each suggested commit yourself.");
+            });
             if ui.button("Settings").clicked() {
                 actions.push(Action::OpenSettings);
             }
@@ -221,5 +240,50 @@ pub fn file_header(ui: &mut Ui, sf: &SelectedFile, reviewed: bool, unified: bool
                 ui.weak("no newline at end of file");
             }
         }
+    });
+}
+
+pub fn bisect_bar(ui: &mut Ui, verdict: &Result<review_core::bisect::Verdict, String>, actions: &mut Vec<Action>) {
+    use review_core::bisect::Verdict;
+    let pal = palette(ui);
+    egui::Frame::new().fill(pal.moved_bg).inner_margin(4.0).corner_radius(4.0).show(ui, |ui| {
+        ui.horizontal_wrapped(|ui| {
+            ui.strong("Bisect");
+            match verdict {
+                Err(e) => {
+                    ui.colored_label(ui.visuals().error_fg_color, e);
+                }
+                Ok(Verdict::NeedBad) => {
+                    ui.label("Select a commit that has the problem and mark it Bad (Bisect menu).");
+                }
+                Ok(Verdict::NeedGood) => {
+                    ui.label("Now select an older commit without the problem and mark it Good.");
+                }
+                Ok(Verdict::Next { commit, remaining }) => {
+                    ui.label(format!("{remaining} commits could be the culprit. Test next:"));
+                    if ui.link(RichText::new(commit.to_hex_with_len(8).to_string()).monospace()).clicked() {
+                        actions.push(Action::BisectGo);
+                    }
+                    ui.weak("then mark it Good, Bad or Skip.");
+                }
+                Ok(Verdict::Found(commit)) => {
+                    ui.label(RichText::new("First bad commit:").color(pal.warn));
+                    if ui.link(RichText::new(commit.to_hex_with_len(8).to_string()).monospace()).clicked() {
+                        actions.push(Action::BisectGo);
+                    }
+                }
+                Ok(Verdict::OnlySkipped(c)) => {
+                    ui.label(format!("Only skipped commits are left ({}); one of them introduced the problem.", c.len()));
+                }
+            }
+            for (mark, label) in [(super::BisectMark::Good, "Good"), (super::BisectMark::Bad, "Bad"), (super::BisectMark::Skip, "Skip")] {
+                if ui.small_button(label).on_hover_text("Mark the selected commit").clicked() {
+                    actions.push(Action::BisectMark(mark));
+                }
+            }
+            if ui.small_button("Reset").clicked() {
+                actions.push(Action::BisectReset);
+            }
+        });
     });
 }

@@ -3,6 +3,11 @@
 use egui::{Align2, FontId, Rect, RichText, Sense, TextStyle, Ui, pos2, vec2};
 use review_core::git::format_time;
 
+use std::collections::{HashMap, HashSet};
+
+use review_core::ObjectId;
+use review_core::laravel::risk::Risk;
+
 use super::{Action, palette};
 use crate::state::RepoState;
 
@@ -10,7 +15,15 @@ const ROW_H: f32 = 40.0;
 /// Ask for more commits when the last visible row is this close to the end of what's loaded.
 const PREFETCH: usize = 60;
 
-pub fn show(ui: &mut Ui, rs: &mut RepoState, actions: &mut Vec<Action>) {
+/// Per-commit decorations computed elsewhere.
+pub struct Marks<'a> {
+    pub risks: &'a HashMap<ObjectId, Vec<Risk>>,
+    pub good: HashSet<ObjectId>,
+    pub bad: Option<ObjectId>,
+    pub skip: HashSet<ObjectId>,
+}
+
+pub fn show(ui: &mut Ui, rs: &mut RepoState, marks: &Marks<'_>, actions: &mut Vec<Action>) {
     ui.horizontal(|ui| {
         ui.strong("Commits");
         let loaded = if rs.pager_done { format!("{}", rs.commits.len()) } else { format!("{}+", rs.commits.len()) };
@@ -51,6 +64,10 @@ pub fn show(ui: &mut Ui, rs: &mut RepoState, actions: &mut Vec<Action>) {
         if range.end + PREFETCH > rs.visible.len() && !rs.pager_done && !rs.pager_waiting {
             actions.push(Action::LoadMoreCommits);
         }
+        let missing: Vec<ObjectId> = range.clone().map(|vi| rs.commits[rs.visible[vi]].id).filter(|id| !marks.risks.contains_key(id)).collect();
+        if !missing.is_empty() {
+            actions.push(Action::ComputeRisks(missing));
+        }
         for vi in range {
             let idx = rs.visible[vi];
             let c = &rs.commits[idx];
@@ -76,6 +93,16 @@ pub fn show(ui: &mut Ui, rs: &mut RepoState, actions: &mut Vec<Action>) {
                 painter.galley(pos2(r.min.x + 4.0, r.center().y - galley.size().y / 2.0), galley, colour);
                 right = r.min.x - 4.0;
             };
+            if marks.bad == Some(c.id) {
+                badge("bad", pal.status(review_core::git::ChangeStatus::Deleted));
+            } else if marks.good.contains(&c.id) {
+                badge("good", pal.status(review_core::git::ChangeStatus::Added));
+            } else if marks.skip.contains(&c.id) {
+                badge("skip", pal.weak);
+            }
+            for r in marks.risks.get(&c.id).into_iter().flatten().rev() {
+                badge(r.label(), pal.warn);
+            }
             if c.ai_assisted {
                 badge("AI", pal.ai);
             }
