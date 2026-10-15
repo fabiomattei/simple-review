@@ -130,6 +130,40 @@ pub fn settings(ctx: &egui::Context, d: &mut SettingsDialog, actions: &mut Vec<A
                 ui.checkbox(&mut d.live_refresh, "Show new commits as they appear");
                 ui.end_row();
             });
+            ui.separator();
+            ui.strong("Project tools");
+            ui.checkbox(&mut d.trusted, "Trust this repository: allow running its tools");
+            ui.label(
+                RichText::new(
+                    "PHPStan, Pint, the language server and ide-helper execute code from the repository \
+                     (configuration, extensions, bootstrap files). Only enable this for code you trust.",
+                )
+                .small()
+                .color(ui.visuals().warn_fg_color),
+            );
+            ui.add_enabled_ui(d.trusted, |ui| {
+                egui::Grid::new("tools_grid").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
+                    ui.label("PHPStan");
+                    ui.add(egui::TextEdit::singleline(&mut d.phpstan_cmd).hint_text("vendor/bin/phpstan"));
+                    ui.end_row();
+                    ui.label("Pint");
+                    ui.add(egui::TextEdit::singleline(&mut d.pint_cmd).hint_text("vendor/bin/pint"));
+                    ui.end_row();
+                    ui.label("Language server");
+                    ui.add(egui::TextEdit::singleline(&mut d.lsp_cmd).hint_text("phpactor language-server"));
+                    ui.end_row();
+                    ui.label("");
+                    ui.checkbox(&mut d.use_lsp, "Use it for go to definition and references");
+                    ui.end_row();
+                });
+            });
+            egui::Grid::new("coverage_grid").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
+                ui.label("Coverage (Clover XML)");
+                ui.add(egui::TextEdit::singleline(&mut d.coverage_path).hint_text("coverage.xml"))
+                    .on_hover_text("Relative to the repository root, or absolute. Reading it runs nothing.");
+                ui.end_row();
+            });
+            ui.separator();
             ui.label("Ignored paths (collapsed and not indexed), one per line:");
             ui.weak("dir/  matches a directory · *.ext  matches a suffix · anything else a file name or path");
             ui.add(egui::TextEdit::multiline(&mut d.ignored_paths).desired_rows(6).desired_width(f32::INFINITY).code_editor());

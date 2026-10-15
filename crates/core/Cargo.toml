@@ -17,6 +17,10 @@ tree-sitter.workspace = true
 tree-sitter-php.workspace = true
 streaming-iterator.workspace = true
 notify.workspace = true
+regex.workspace = true
+quick-xml.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

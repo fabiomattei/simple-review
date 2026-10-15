@@ -19,7 +19,7 @@ pub struct Fixture {
 impl Fixture {
     /// Commits reachable from `main` (the `topic_*` ones are on an unmerged branch).
     pub fn main_commit_count(&self) -> usize {
-        self.commits.keys().filter(|k| !k.starts_with("topic")).count()
+        self.commits.keys().filter(|k| !k.starts_with("topic") && !k.starts_with("leak")).count()
     }
 
     pub fn commit(&self, name: &str) -> &str {
@@ -211,7 +211,8 @@ const ROUTES: &str = "<?php\n\nuse Illuminate\\Support\\Facades\\Route;\n\nRoute
 /// `pint` (whitespace-only reformat), `ignore_revs` (adds `.git-blame-ignore-revs`),
 /// `delete` (removes a file), `old_laptop` (identity merged by `.mailmap`), `rebased` (author ≠ committer), `ai` (Co-Authored-By: Claude),
 /// `main_tz`, then `feature_tz` on a branch, `merge` (conflict resolved by hand), `crlf`.
-/// Branch `topic` (unmerged, off `crlf`): `topic_discount`, `topic_test`. HEAD is `main`.
+/// Branch `topic` (unmerged, off `crlf`): `topic_discount`, `topic_test`.
+/// Branch `leak` (off `crlf`): `leak_secret` adds a Stripe key and an AWS key. HEAD is `main`.
 pub fn build(dir: &Path) -> Result<Fixture> {
     std::fs::create_dir_all(dir)?;
     if std::fs::read_dir(dir)?.next().is_some() {
@@ -306,6 +307,16 @@ pub fn build(dir: &Path) -> Result<Fixture> {
     commits.insert("topic_discount", b.commit("Raise discount threshold", ALICE, ALICE)?);
     b.write("tests/Unit/InvoiceServiceTest.php", "<?php\n\nnamespace Tests\\Unit;\n\nuse App\\Services\\InvoiceService;\n\nclass InvoiceServiceTest extends TestCase\n{\n    public function test_total(): void\n    {\n        $this->assertSame(0.0, (new InvoiceService())->total([]));\n    }\n}\n")?;
     commits.insert("topic_test", b.commit("Test invoice totals", ALICE, ALICE)?);
+    b.git(&["checkout", "-q", "main"], ALICE, ALICE)?;
+
+    // A branch that commits credentials, for secret detection.
+    b.git(&["checkout", "-q", "-b", "leak", commits["crlf"].as_str()], BOB, BOB)?;
+    b.write(
+        "config/services.php",
+        "<?php\n\nreturn [\n    'stripe' => [\n        'secret' => 'sk_live_4eC39HqLyjWDarjtT1zdp7dc',\n        'key' => env('STRIPE_KEY'),\n    ],\n];\n",
+    )?;
+    b.write(".env.example", "APP_NAME=Shop\nAWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLQ\nDB_PASSWORD=\n")?;
+    commits.insert("leak_secret", b.commit("Configure payments", BOB, BOB)?);
     b.git(&["checkout", "-q", "main"], ALICE, ALICE)?;
 
     Ok(Fixture { path: dir.to_path_buf(), commits })

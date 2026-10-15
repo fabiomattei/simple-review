@@ -18,13 +18,21 @@ pub struct BlameInfo<'a> {
     pub error: Option<&'a str>,
 }
 
-pub fn show(ui: &mut Ui, peek: &Peek, blame: &BlameInfo<'_>, comments: Option<&CommentsView>, actions: &mut Vec<Action>) {
+pub fn show(
+    ui: &mut Ui,
+    peek: &Peek,
+    blame: &BlameInfo<'_>,
+    comments: Option<&CommentsView>,
+    quality: Option<&super::quality::QualityView>,
+    actions: &mut Vec<Action>,
+) {
     ui.horizontal(|ui| {
         for (tab, label, hint) in [
             (PeekTab::Definition, "Definition", "F12 / Cmd+click"),
             (PeekTab::References, "References", "Shift+F12"),
             (PeekTab::Blame, "Blame", "Line history for the cursor line"),
             (PeekTab::Comments, "Comments", "Review comments (c to add, . and , to step)"),
+            (PeekTab::Quality, "Quality", "New warnings, secrets, complexity, coverage (q)"),
         ] {
             if ui.selectable_label(peek.tab == tab, label).on_hover_text(hint).clicked() {
                 actions.push(Action::PeekTab(tab));
@@ -41,6 +49,12 @@ pub fn show(ui: &mut Ui, peek: &Peek, blame: &BlameInfo<'_>, comments: Option<&C
         PeekTab::Definition => definition(ui, peek, actions),
         PeekTab::References => references(ui, peek, actions),
         PeekTab::Blame => blame_tab(ui, blame, actions),
+        PeekTab::Quality => match quality {
+            Some(view) => super::quality::show(ui, view, actions),
+            None => {
+                ui.weak("Select a commit.");
+            }
+        },
         PeekTab::Comments => match comments {
             Some(view) => super::comments::show(ui, view, actions),
             None => {
@@ -65,6 +79,39 @@ fn definition(ui: &mut Ui, peek: &Peek, actions: &mut Vec<Action>) {
         }
         DefinitionState::NotFound(msg) => {
             ui.label(msg);
+        }
+        DefinitionState::LspPending { .. } => {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label(format!("Asking the language server at {}… (the first request starts it)", def.version.label));
+            });
+        }
+        DefinitionState::Lsp { name, targets, selected } => {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(name).monospace().strong());
+                ui.weak(format!("at {} · via language server", def.version.label));
+            });
+            if targets.len() > 1 {
+                for (i, t) in targets.iter().enumerate() {
+                    if ui.selectable_label(i == *selected, RichText::new(t.label()).monospace()).clicked() {
+                        actions.push(Action::PeekSelect(i));
+                    }
+                }
+                ui.separator();
+            }
+            if let Some(t) = targets.get(*selected) {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(t.label()).monospace());
+                    if t.rel.is_some() {
+                        if ui.button("Open (o)").clicked() {
+                            actions.push(Action::OpenDefinition);
+                        }
+                    } else {
+                        ui.weak("outside the repository");
+                    }
+                });
+            }
+            snippet_view(ui, def.snippet.as_ref(), None);
         }
         DefinitionState::Ready { lookup, selected } => {
             ui.horizontal(|ui| {
@@ -95,23 +142,31 @@ fn definition(ui: &mut Ui, peek: &Peek, actions: &mut Vec<Action>) {
                     actions.push(Action::OpenDefinition);
                 }
             });
-            if let Some(snippet) = &def.snippet {
-                let font = TextStyle::Monospace.resolve(ui.style());
-                egui::ScrollArea::both().id_salt("def_snippet").auto_shrink([false, true]).show(ui, |ui| {
-                    for (i, line) in snippet.lines.iter().enumerate() {
-                        let n = snippet.first_line as usize + i;
-                        let spans = snippet.highlighted.as_ref().and_then(|h| h.get(i)).map(Vec::as_slice).unwrap_or(&[]);
-                        let name = c.symbol.span.start as usize..c.symbol.span.end as usize;
-                        let inline = if n as u32 == c.symbol.span.line { std::slice::from_ref(&name) } else { &[] };
-                        ui.horizontal(|ui| {
-                            ui.add_sized([40.0, 14.0], egui::Label::new(RichText::new(format!("{}", n + 1)).monospace().color(pal.weak)));
-                            ui.label(line_job(line, spans, inline, &font, pal.text, pal.cursor_line.gamma_multiply(3.0)));
-                        });
-                    }
-                });
-            }
+            let name = (c.symbol.span.line, c.symbol.span.start as usize..c.symbol.span.end as usize);
+            snippet_view(ui, def.snippet.as_ref(), Some(name));
         }
     }
+}
+
+/// Source lines with numbers; `mark` highlights a byte range on one line.
+fn snippet_view(ui: &mut Ui, snippet: Option<&crate::state::Snippet>, mark: Option<(u32, std::ops::Range<usize>)>) {
+    let Some(snippet) = snippet else { return };
+    let pal = palette(ui);
+    let font = TextStyle::Monospace.resolve(ui.style());
+    egui::ScrollArea::both().id_salt("def_snippet").auto_shrink([false, true]).show(ui, |ui| {
+        for (i, line) in snippet.lines.iter().enumerate() {
+            let n = snippet.first_line as usize + i;
+            let spans = snippet.highlighted.as_ref().and_then(|h| h.get(i)).map(Vec::as_slice).unwrap_or(&[]);
+            let inline = match &mark {
+                Some((l, r)) if *l as usize == n => std::slice::from_ref(r),
+                _ => &[],
+            };
+            ui.horizontal(|ui| {
+                ui.add_sized([40.0, 14.0], egui::Label::new(RichText::new(format!("{}", n + 1)).monospace().color(pal.weak)));
+                ui.label(line_job(line, spans, inline, &font, pal.text, pal.cursor_line.gamma_multiply(3.0)));
+            });
+        }
+    });
 }
 
 fn references(ui: &mut Ui, peek: &Peek, actions: &mut Vec<Action>) {
@@ -129,6 +184,27 @@ fn references(ui: &mut Ui, peek: &Peek, actions: &mut Vec<Action>) {
         }
         ReferencesState::NotFound(msg) => {
             ui.label(msg);
+        }
+        ReferencesState::LspPending { .. } => {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label("Asking the language server…");
+            });
+        }
+        ReferencesState::Lsp { name, targets } => {
+            ui.horizontal(|ui| {
+                ui.label(format!("{} reference{} to", targets.len(), if targets.len() == 1 { "" } else { "s" }));
+                ui.label(RichText::new(name).monospace());
+                ui.weak(format!("at {} · via language server", refs.version.label));
+            });
+            egui::ScrollArea::vertical().id_salt("lsp_refs").auto_shrink([false, true]).show(ui, |ui| {
+                for (i, t) in targets.iter().enumerate() {
+                    let colour = if t.rel.is_some() { pal.text } else { pal.weak };
+                    if ui.selectable_label(false, RichText::new(format!("{}  {}", t.label(), t.context)).monospace().color(colour)).clicked() {
+                        actions.push(Action::OpenReference(i));
+                    }
+                }
+            });
         }
         ReferencesState::Ready { target, hits } => {
             ui.horizontal(|ui| {

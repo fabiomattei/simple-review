@@ -369,3 +369,120 @@ fn comments_export_ranges_and_live_refresh() {
         app.rs.as_ref().unwrap().commits.first().is_some_and(|c| c.summary == "Made by Claude Code")
     });
 }
+
+/// A stand-in for PHPStan: flags every line calling round() or discount().
+const FAKE_PHPSTAN: &str = r#"#!/bin/sh
+first=1
+printf '{"totals":{},"files":{'
+for f in "$@"; do
+  case "$f" in -*|analyse) continue;; esac
+  msgs=$(grep -n -e 'round(' -e 'discount(' "$f" | awk -F: '{ printf "%s{\"message\":\"Suspicious call\",\"line\":%d}", (n++ ? "," : ""), $1 }')
+  [ -z "$msgs" ] && continue
+  [ $first = 1 ] || printf ','
+  first=0
+  printf '"%s/%s":{"errors":1,"messages":[%s]}' "$PWD" "$f" "$msgs"
+done
+printf '},"errors":[]}'
+"#;
+
+#[test]
+fn quality_signals() {
+    let tmp = tempfile::tempdir().unwrap();
+    let fx = fixture::build(&tmp.path().join("repo")).unwrap();
+    let invoice = "app/Services/InvoiceService.php";
+
+    // Coverage report (in the working copy, untracked): the discount call is never run.
+    let repo = review_core::git::Repo::open(&fx.path).unwrap();
+    let ai = parse_id(fx.commit("ai")).unwrap();
+    let text = String::from_utf8(repo.read_blob(repo.find_file(ai, invoice).unwrap().unwrap().id).unwrap()).unwrap();
+    let line_no = |needle: &str| text.lines().position(|l| l.contains(needle)).unwrap() as u32;
+    let (discount_call, round_call) = (line_no("$sum -= $this->discount("), line_no("return $this->round("));
+    std::fs::write(
+        fx.path.join("coverage.xml"),
+        format!(
+            r#"<?xml version="1.0"?><coverage><project><file name="/ci/shop/{invoice}"><line num="{}" type="stmt" count="0"/><line num="{}" type="stmt" count="4"/></file></project></coverage>"#,
+            discount_call + 1,
+            round_call + 1
+        ),
+    )
+    .unwrap();
+    let bin = tmp.path().join("fake-phpstan");
+    std::fs::write(&bin, FAKE_PHPSTAN).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    // SAFETY: no other test reads this variable; snapshots go to the temp dir, not the user's cache.
+    unsafe { std::env::set_var("SIMPLE_REVIEW_CACHE", tmp.path().join("cache")) };
+
+    let path = fx.path.clone();
+    let mut harness = Harness::builder()
+        .with_size(egui::vec2(1400.0, 900.0))
+        .wgpu()
+        .build_eframe(move |cc| {
+            cc.egui_ctx.set_visuals(egui::Visuals::dark());
+            ReviewApp::with_store(cc, Store::in_memory(), Some(path))
+        });
+    wait_until(&mut harness, "first diff", view_ready);
+
+    // Secrets on the unmerged `leak` branch.
+    harness.state_mut().apply(Action::OpenCommit { id: parse_id(fx.commit("leak_secret")).unwrap(), path: None });
+    wait_until(&mut harness, "secret scan", |app| app.secret_scans.values().any(|f| f.len() == 2));
+
+    // Complexity and coverage for the discount commit.
+    select_summary(&mut harness, "Add volume discount");
+    wait_until(&mut harness, "file quality", |app| {
+        file_ready(app, invoice)
+            && app.rs.as_ref().unwrap().commit.as_ref().unwrap().file.as_ref().unwrap().quality.is_some()
+    });
+    {
+        let q = harness.state().rs.as_ref().unwrap().commit.as_ref().unwrap().file.as_ref().unwrap().quality.clone().unwrap();
+        assert_eq!(q.complexity[0].name, "InvoiceService::discount");
+        assert_eq!(q.uncovered, Some(vec![discount_call]));
+        assert!(q.secrets.is_empty());
+    }
+
+    // Untrusted: nothing runs.
+    harness.state_mut().apply(Action::RunAnalysis);
+    assert!(harness.state().analyses.is_empty());
+
+    // Trusted, with the stand-in PHPStan: only the discount() lines are new.
+    {
+        let settings = &mut harness.state_mut().rs.as_mut().unwrap().settings;
+        settings.trusted = true;
+        settings.phpstan_cmd = bin.display().to_string();
+        settings.pint_cmd = "true".into();
+    }
+    harness.key_press(Key::Q);
+    harness.state_mut().apply(Action::RunAnalysis);
+    wait_until(&mut harness, "analysis", |app| {
+        app.analyses.values().any(|s| matches!(s, crate::state::AnalysisState::Done(_) | crate::state::AnalysisState::Failed(_)))
+    });
+    let warnings = harness.state().file_warnings();
+    let lines: Vec<u32> = warnings.iter().map(|(_, l, _)| *l).collect();
+    assert_eq!(lines, vec![discount_call, line_no("private function discount(")], "{warnings:?}");
+    wait_until(&mut harness, "highlighting", |app| app.hl_pending.is_empty());
+    snapshot(&mut harness, "quality_tab");
+
+    // Precise navigation through Phpactor, when available.
+    if let Ok(phpactor) = std::env::var("PHPACTOR") {
+        {
+            let settings = &mut harness.state_mut().rs.as_mut().unwrap().settings;
+            settings.use_lsp = true;
+            settings.lsp_cmd = format!("{phpactor} language-server");
+        }
+        let (line, col) = line_of(harness.state(), Side::New, "round($sum)");
+        harness.state_mut().apply(Action::SetCursor(Cursor { side: Side::New, line, col }));
+        harness.state_mut().apply(Action::GoToDefinition);
+        wait_until(&mut harness, "language server", |app| {
+            matches!(app.peek.definition.as_ref().map(|d| &d.state), Some(DefinitionState::Lsp { .. } | DefinitionState::Ready { .. }))
+        });
+        let Some(DefinitionState::Lsp { targets, .. }) = harness.state().peek.definition.as_ref().map(|d| &d.state) else {
+            panic!("fell back to the symbol index")
+        };
+        assert_eq!(targets[0].rel.as_deref(), Some(invoice));
+        assert_eq!(targets[0].line, line_no("private function round("));
+        snapshot(&mut harness, "lsp_definition");
+    }
+}

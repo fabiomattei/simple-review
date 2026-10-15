@@ -375,3 +375,135 @@ mod phase3 {
         assert!(watcher.wait(std::time::Duration::from_secs(10)), "no change event");
     }
 }
+
+mod phase4 {
+    use super::*;
+    use review_core::analysis::{self, ToolCommands, complexity, secrets, snapshot, tools::Tool};
+    use review_core::diff::DiffOptions;
+
+    fn text_diff(repo: &Repo, change: &review_core::git::FileChange) -> review_core::diff::FileDiff {
+        let FileView::Text { diff, .. } = file_view::load(repo, change, DiffOptions::default(), false).unwrap() else { panic!() };
+        diff
+    }
+
+    #[test]
+    fn finds_committed_secrets() {
+        let (_dir, fx, repo) = setup();
+        let files = changes(&repo, &fx, "leak_secret");
+        let mut kinds: Vec<(String, &str)> = Vec::new();
+        for f in &files {
+            for s in secrets::scan_diff(&text_diff(&repo, f)) {
+                kinds.push((f.path().to_string(), s.kind));
+            }
+        }
+        kinds.sort();
+        assert_eq!(
+            kinds,
+            vec![(".env.example".into(), "AWS access key"), ("config/services.php".into(), "Stripe live key")]
+        );
+        // Nothing in an ordinary commit.
+        for f in &changes(&repo, &fx, "ai") {
+            assert!(secrets::scan_diff(&text_diff(&repo, f)).is_empty());
+        }
+    }
+
+    #[test]
+    fn complexity_of_a_commit() {
+        let (_dir, fx, repo) = setup();
+        let change = &changes(&repo, &fx, "ai")[0];
+        let diff = text_diff(&repo, change);
+        let changed = complexity::compare(&diff.old.lines.join("\n"), &diff.new.lines.join("\n"));
+        let names: Vec<_> = changed.iter().map(|c| c.name.as_str()).collect();
+        // forUser lost the blank line Pint had added.
+        assert_eq!(names, vec!["InvoiceService::discount", "InvoiceService::total", "InvoiceService::forUser"]);
+        assert_eq!(changed[0].new.unwrap().branches, 1);
+        assert!(changed[0].old.is_none());
+        assert_eq!((changed[1].branch_delta(), changed[1].line_delta()), (0, 1));
+        assert_eq!((changed[2].branch_delta(), changed[2].line_delta()), (0, -1));
+    }
+
+    #[test]
+    fn snapshots_are_written_from_git_and_link_vendor() {
+        let (dir, fx, repo) = setup();
+        std::fs::create_dir_all(fx.path.join("vendor/bin")).unwrap();
+        std::fs::write(fx.path.join("vendor/autoload.php"), "<?php\n").unwrap();
+        let cache = dir.path().join("cache");
+        let id = parse_id(fx.commit("move")).unwrap();
+        let snap = snapshot::ensure(&repo, id, &cache, &|| false).unwrap();
+        assert!(snap.vendor_linked && !snap.vendor_mismatch);
+        let text = std::fs::read_to_string(snap.dir.join("app/Services/InvoiceService.php")).unwrap();
+        assert!(text.contains("forUser"));
+        assert!(snap.dir.join("app/Helpers/legacy.php").exists(), "deleted only later, in `delete`");
+        // Reused, and the repository itself is untouched.
+        let again = snapshot::ensure(&repo, id, &cache, &|| false).unwrap();
+        assert_eq!(again.dir, snap.dir);
+        let status = std::process::Command::new("git").args(["status", "--porcelain"]).current_dir(&fx.path).output().unwrap();
+        assert_eq!(String::from_utf8_lossy(&status.stdout).trim(), "?? vendor/");
+        snapshot::ensure(&repo, parse_id(fx.commit("ai")).unwrap(), &cache, &|| false).unwrap();
+        assert_eq!(snapshot::prune(&cache, &repo, 1).unwrap(), 1);
+    }
+
+    /// A stand-in for PHPStan: flags every line calling round() or discount().
+    const FAKE_PHPSTAN: &str = r#"#!/bin/sh
+first=1
+printf '{"totals":{},"files":{'
+for f in "$@"; do
+  case "$f" in -*|analyse) continue;; esac
+  msgs=$(grep -n -e 'round(' -e 'discount(' "$f" | awk -F: '{ printf "%s{\"message\":\"Suspicious call\",\"line\":%d}", (n++ ? "," : ""), $1 }')
+  [ -z "$msgs" ] && continue
+  [ $first = 1 ] || printf ','
+  first=0
+  printf '"%s/%s":{"errors":1,"messages":[%s]}' "$PWD" "$f" "$msgs"
+done
+printf '},"errors":[]}'
+"#;
+
+    #[test]
+    fn reports_only_warnings_the_commit_introduced() {
+        let (dir, fx, repo) = setup();
+        let bin = dir.path().join("fake-phpstan");
+        std::fs::write(&bin, FAKE_PHPSTAN).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let ai = commit(&repo, &fx, "ai");
+        let files = repo.changed_files(Some(ai.parents[0]), ai.id).unwrap();
+        let commands = ToolCommands { phpstan: bin.display().to_string(), pint: "true".into() };
+        let result = analysis::analyse_change(&repo, &dir.path().join("cache"), Some(ai.parents[0]), ai.id, &files, &commands, &|_| {}, &|| false).unwrap();
+        assert_eq!(result.ran, vec![Tool::PhpStan, Tool::Pint]);
+        let lines: Vec<_> = result.introduced.iter().map(|w| (w.path.as_str(), w.line.unwrap())).collect();
+        let text = String::from_utf8(repo.read_blob(files[0].new.as_ref().unwrap().id).unwrap()).unwrap();
+        let expected: Vec<_> = text
+            .lines()
+            .enumerate()
+            .filter(|(_, l)| l.contains("discount("))
+            .map(|(i, _)| ("app/Services/InvoiceService.php", i as u32))
+            .collect();
+        assert_eq!(lines, expected);
+        assert!(result.new_total > result.introduced.len(), "round() warnings exist in both versions");
+        assert!(result.notes.iter().any(|n| n.contains("vendor/")), "{:?}", result.notes);
+    }
+
+    /// Needs Phpactor: `PHPACTOR="php /path/phpactor.phar" cargo test -- --ignored`.
+    #[test]
+    #[ignore]
+    fn phpactor_goes_to_definition() {
+        let Ok(cmd) = std::env::var("PHPACTOR") else { return };
+        let (dir, fx, repo) = setup();
+        let id = parse_id(fx.commit("move")).unwrap();
+        let snap = snapshot::ensure(&repo, id, &dir.path().join("cache"), &|| false).unwrap();
+        let mut cmd: Vec<String> = cmd.split_whitespace().map(String::from).collect();
+        cmd.push("language-server".into());
+        let mut client = review_core::lsp::LspClient::start(&cmd, &snap.dir).unwrap();
+        let path = "app/Services/InvoiceService.php";
+        let text = std::fs::read_to_string(snap.dir.join(path)).unwrap();
+        let (line, l) = text.lines().enumerate().find(|(_, l)| l.contains("$this->round(")).unwrap();
+        let col = l.find("round").unwrap() as u32 + 1;
+        let defs = client.definition(path, line as u32, col).unwrap();
+        let def_line = text.lines().position(|l| l.contains("private function round")).unwrap() as u32;
+        assert!(defs.iter().any(|d| d.path.ends_with(path) && d.line == def_line), "{defs:?}");
+        client.shutdown();
+    }
+}

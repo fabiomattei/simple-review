@@ -9,6 +9,7 @@ pub mod header;
 pub mod help;
 pub mod markdown;
 pub mod peek;
+pub mod quality;
 
 use std::path::PathBuf;
 
@@ -22,6 +23,10 @@ use crate::state::{CommentScope, Cursor, PeekTab, StatusFilter};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Action {
+    GoToLine { path: String, line: u32 },
+    RunAnalysis,
+    ToggleCoverage,
+    ShowQuality,
     SetCursor(Cursor),
     /// Extend the line selection from the cursor to here (drag or Shift+click).
     SelectTo(Cursor),

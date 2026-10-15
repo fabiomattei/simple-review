@@ -62,6 +62,14 @@ pub struct ReviewApp {
     settings_dialog: Option<SettingsDialog>,
     /// A short-lived message in the status bar.
     toast: Option<(String, Instant)>,
+    analyses: HashMap<crate::state::AnalysisKey, crate::state::AnalysisState>,
+    secret_scans: HashMap<crate::state::AnalysisKey, Vec<(String, review_core::analysis::secrets::SecretFinding)>>,
+    secret_pending: HashSet<crate::state::AnalysisKey>,
+    coverage: Option<Arc<review_core::analysis::coverage::Coverage>>,
+    coverage_note: Option<String>,
+    coverage_on: bool,
+    lsp_servers: Arc<std::sync::Mutex<HashMap<ObjectId, review_core::lsp::LspClient>>>,
+    lsp_counter: u64,
 }
 
 impl ReviewApp {
@@ -83,6 +91,7 @@ impl ReviewApp {
         let unified = pref("unified", false);
         let blame_on = pref("blame", false);
         let blame_by_committer = pref("blame_by_committer", false);
+        let coverage_on = pref("coverage", true);
         let recent = store.as_ref().and_then(|s| s.recent_repos(12).ok()).unwrap_or_default();
 
         // Load syntax definitions off the UI thread so the first diff doesn't pay for it.
@@ -120,6 +129,14 @@ impl ReviewApp {
             compare: None,
             settings_dialog: None,
             toast: None,
+            analyses: HashMap::new(),
+            secret_scans: HashMap::new(),
+            secret_pending: HashSet::new(),
+            coverage: None,
+            coverage_note: None,
+            coverage_on,
+            lsp_servers: Arc::default(),
+            lsp_counter: 0,
         };
         if let Some(path) = initial {
             app.open_repo(&path);
@@ -202,6 +219,11 @@ impl ReviewApp {
         self.settings_dialog = None;
         self.load_threads();
         self.start_watcher();
+        self.shutdown_language_servers();
+        self.analyses.clear();
+        self.secret_scans.clear();
+        self.secret_pending.clear();
+        self.load_coverage();
     }
 
     fn select_commit(&mut self, info: CommitInfo, parent_idx: usize, path: Option<String>, push: bool) {
@@ -408,6 +430,22 @@ impl ReviewApp {
                     self.blames.insert(key, result);
                 }
                 JobResult::Exported(result) => self.on_exported(result),
+                JobResult::Analysis { key, result } => {
+                    let state = match result {
+                        Ok(r) => {
+                            self.toast(format!("Analysis done: {} new warning(s)", r.introduced.len()));
+                            crate::state::AnalysisState::Done(r)
+                        }
+                        Err(e) => crate::state::AnalysisState::Failed(e),
+                    };
+                    self.analyses.insert(key, state);
+                }
+                JobResult::Secrets { key, findings } => {
+                    self.secret_pending.remove(&key);
+                    self.secret_scans.insert(key, findings);
+                }
+                JobResult::LspDefinition { request, result } => self.on_lsp_definition(request, result),
+                JobResult::LspReferences { request, result } => self.on_lsp_references(request, result),
                 JobResult::Tree { commit, result } => {
                     if let Some(sc) = self.rs.as_mut().and_then(|rs| rs.commit.as_mut())
                         && sc.info.id == commit
@@ -421,6 +459,8 @@ impl ReviewApp {
         self.ensure_blame();
         self.poll_watcher();
         self.ensure_placed();
+        self.ensure_file_quality();
+        self.ensure_secret_scan();
         if self.toast.as_ref().is_some_and(|(_, at)| at.elapsed() > Duration::from_secs(6)) {
             self.toast = None;
         }
@@ -633,16 +673,26 @@ impl ReviewApp {
                 self.peek.tab = tab;
             }
             Action::PeekSelect(i) => {
-                if let Some(def) = self.peek.definition.as_mut()
-                    && let crate::state::DefinitionState::Ready { selected, .. } = &mut def.state
-                {
-                    *selected = i;
+                if let Some(def) = self.peek.definition.as_mut() {
+                    match &mut def.state {
+                        crate::state::DefinitionState::Ready { selected, .. } | crate::state::DefinitionState::Lsp { selected, .. } => {
+                            *selected = i
+                        }
+                        _ => {}
+                    }
                 }
                 self.load_snippet();
             }
             Action::OpenDefinition => self.open_definition(),
             Action::OpenReference(i) => self.open_reference(i),
             Action::ClosePeek => self.peek.open = false,
+            Action::GoToLine { path, line } => self.go_to_changed_line(&path, line),
+            Action::RunAnalysis => self.run_analysis(),
+            Action::ShowQuality => self.show_quality(),
+            Action::ToggleCoverage => {
+                self.coverage_on = !self.coverage_on;
+                self.save_pref("coverage", self.coverage_on);
+            }
             Action::SelectTo(to) => {
                 if let Some(sf) = self.current_file_mut() {
                     match sf.cursor {
@@ -817,6 +867,8 @@ impl ReviewApp {
                 (Key::T, Action::ToggleAllFiles),
                 (Key::O, Action::OpenDefinition),
                 (Key::C, Action::StartComment),
+                (Key::V, Action::ToggleCoverage),
+                (Key::Q, Action::ShowQuality),
                 (Key::Period, Action::NextThread),
                 (Key::Comma, Action::PrevThread),
                 (Key::F5, Action::Reload),
@@ -939,6 +991,15 @@ impl ReviewApp {
         let blame_on = self.blame_on;
         let by_committer = self.blame_by_committer;
         let marks = self.thread_marks();
+        let warnings = self.file_warnings();
+        let quality = (self.peek.open && self.peek.tab == crate::state::PeekTab::Quality).then(|| self.quality_view());
+        let secret_count = self
+            .rs
+            .as_ref()
+            .and_then(|rs| rs.commit.as_ref())
+            .and_then(|sc| self.secret_scans.get(&(sc.parent(), sc.info.id)))
+            .map_or(0, Vec::len);
+        let coverage_on = self.coverage_on;
         let comments = (self.peek.open && self.peek.tab == crate::state::PeekTab::Comments).then(|| self.comments_view());
         if comments.is_some() {
             self.peek.reveal_thread = false;
@@ -959,6 +1020,13 @@ impl ReviewApp {
             return;
         };
         ui::header::commit_details(ui, sc, range_label.as_deref(), actions);
+        if secret_count > 0
+            && ui
+                .button(RichText::new(format!("⚠ This commit adds {secret_count} possible secret(s): show")).color(ui::palette(ui).warn))
+                .clicked()
+        {
+            actions.push(Action::ShowQuality);
+        }
         ui.separator();
         let reviewed = sc.file.as_ref().is_some_and(|f| sc.reviewed.contains(f.change.path()));
         let Some(sf) = sc.file.as_mut() else {
@@ -999,7 +1067,7 @@ impl ReviewApp {
                 .resizable(true)
                 .default_size(260.0)
                 .min_size(120.0)
-                .show(ui, |ui| ui::peek::show(ui, &self.peek, &info, comments.as_ref(), actions));
+                .show(ui, |ui| ui::peek::show(ui, &self.peek, &info, comments.as_ref(), quality.as_ref(), actions));
         }
 
         let message = |ui: &mut Ui, text: String, button: Option<&str>, actions: &mut Vec<Action>| {
@@ -1061,6 +1129,8 @@ impl ReviewApp {
                         blame: blame_on.then(|| BlameInput { old: side_blame(Side::Old), new: side_blame(Side::New), by_committer }),
                         selection: sf.selection,
                         threads: &marks,
+                        warnings: &warnings,
+                        uncovered: if coverage_on { sf.quality.as_ref().and_then(|q| q.uncovered.as_deref()).unwrap_or(&[]) } else { &[] },
                         cursor: sf.cursor,
                     };
                     sf.h_scroll += h_delta;
@@ -1073,7 +1143,7 @@ impl ReviewApp {
 
 fn placeholder_text(p: &Placeholder) -> (String, Option<&'static str>) {
     let sizes = |old: &Option<u64>, new: &Option<u64>| match (old, new) {
-        (Some(o), Some(n)) => format!("{} → {}", human_size(*o), human_size(*n)),
+        (Some(o), Some(n)) => format!("{} -> {}", human_size(*o), human_size(*n)),
         (None, Some(n)) => format!("added, {}", human_size(*n)),
         (Some(o), None) => format!("deleted, was {}", human_size(*o)),
         (None, None) => String::new(),
@@ -1088,7 +1158,7 @@ fn placeholder_text(p: &Placeholder) -> (String, Option<&'static str>) {
         ),
         Placeholder::Submodule { old, new } => (
             format!(
-                "Submodule {} → {}",
+                "Submodule {} -> {}",
                 old.as_deref().unwrap_or("(none)"),
                 new.as_deref().unwrap_or("(removed)")
             ),
@@ -1203,6 +1273,9 @@ mod code_nav;
 
 #[path = "review_ui.rs"]
 mod review_ui;
+
+#[path = "quality_ui.rs"]
+mod quality_ui;
 
 #[cfg(test)]
 #[path = "smoke_test.rs"]

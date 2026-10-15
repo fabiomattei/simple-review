@@ -28,6 +28,18 @@ pub struct RepoSettings {
     pub feedback_path: String,
     /// Watch the repository and show new commits as they appear.
     pub live_refresh: bool,
+    /// The user allows running this project's tools (PHPStan, Pint, the language server), which
+    /// execute code from the repository.
+    pub trusted: bool,
+    /// Clover XML coverage report, relative to the repository root or absolute.
+    pub coverage_path: String,
+    /// Commands; empty means the project's `vendor/bin`.
+    pub phpstan_cmd: String,
+    pub pint_cmd: String,
+    /// Language server command, run in a snapshot of the commit.
+    pub lsp_cmd: String,
+    /// Use the language server for go to definition / references (needs `trusted`).
+    pub use_lsp: bool,
 }
 
 impl Default for RepoSettings {
@@ -37,6 +49,12 @@ impl Default for RepoSettings {
             ignored_paths: DEFAULT_IGNORED_PATHS.iter().map(|s| s.to_string()).collect(),
             feedback_path: "REVIEW_FEEDBACK.md".into(),
             live_refresh: true,
+            trusted: false,
+            coverage_path: "coverage.xml".into(),
+            phpstan_cmd: String::new(),
+            pint_cmd: String::new(),
+            lsp_cmd: "phpactor language-server".into(),
+            use_lsp: false,
         }
     }
 }
@@ -181,6 +199,18 @@ impl Store {
             s.feedback_path = v;
         }
         s.live_refresh = self.get_bool(&scope, "live_refresh", s.live_refresh);
+        s.trusted = self.get_bool(&scope, "trusted", s.trusted);
+        s.use_lsp = self.get_bool(&scope, "use_lsp", s.use_lsp);
+        for (key, field) in [
+            ("coverage_path", &mut s.coverage_path),
+            ("phpstan_cmd", &mut s.phpstan_cmd),
+            ("pint_cmd", &mut s.pint_cmd),
+            ("lsp_cmd", &mut s.lsp_cmd),
+        ] {
+            if let Some(v) = self.get(&scope, key)? {
+                *field = v;
+            }
+        }
         Ok(s)
     }
 
@@ -189,7 +219,18 @@ impl Store {
         self.set(&scope, "base_branch", &s.base_branch)?;
         self.set(&scope, "ignored_paths", &s.ignored_paths.join("\n"))?;
         self.set(&scope, "feedback_path", &s.feedback_path)?;
-        self.set_bool(&scope, "live_refresh", s.live_refresh)
+        self.set_bool(&scope, "live_refresh", s.live_refresh)?;
+        self.set_bool(&scope, "trusted", s.trusted)?;
+        self.set_bool(&scope, "use_lsp", s.use_lsp)?;
+        self.set(&scope, "coverage_path", &s.coverage_path)?;
+        self.set(&scope, "phpstan_cmd", &s.phpstan_cmd)?;
+        self.set(&scope, "pint_cmd", &s.pint_cmd)?;
+        self.set(&scope, "lsp_cmd", &s.lsp_cmd)
+    }
+
+    /// Commands for the analysis tools.
+    pub fn tool_commands(s: &RepoSettings) -> crate::analysis::ToolCommands {
+        crate::analysis::ToolCommands { phpstan: s.phpstan_cmd.clone(), pint: s.pint_cmd.clone() }
     }
 
     pub fn touch_recent(&self, repo: &Path) -> Result<()> {

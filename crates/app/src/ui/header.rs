@@ -74,10 +74,10 @@ pub fn toolbar(ui: &mut Ui, s: &ToolbarState<'_>, actions: &mut Vec<Action>) {
             }
         }
         ui.separator();
-        if ui.add_enabled(s.can_back, egui::Button::new("◀")).on_hover_text("Back (Alt+←)").clicked() {
+        if ui.add_enabled(s.can_back, egui::Button::new("◀")).on_hover_text("Back (Alt+Left)").clicked() {
             actions.push(Action::Back);
         }
-        if ui.add_enabled(s.can_forward, egui::Button::new("▶")).on_hover_text("Forward (Alt+→)").clicked() {
+        if ui.add_enabled(s.can_forward, egui::Button::new("▶")).on_hover_text("Forward (Alt+Right)").clicked() {
             actions.push(Action::Forward);
         }
         ui.separator();
@@ -190,7 +190,7 @@ pub fn file_header(ui: &mut Ui, sf: &SelectedFile, reviewed: bool, unified: bool
             && let Some(old) = &change.old
         {
             ui.label(RichText::new(&old.path).monospace().color(pal.weak));
-            ui.label("→");
+            ui.label("->");
         }
         ui.label(RichText::new(change.path()).monospace().strong());
         if let ViewState::Ready(view) = &sf.view
@@ -212,7 +212,7 @@ pub fn file_header(ui: &mut Ui, sf: &SelectedFile, reviewed: bool, unified: bool
             let notice = |ui: &mut Ui, text: &str| ui.label(RichText::new(format!("⚠ {text}")).color(pal.warn));
             if diff.line_endings_changed() {
                 let (from, to) = if diff.new.crlf { ("LF", "CRLF") } else { ("CRLF", "LF") };
-                notice(ui, &format!("line endings changed {from} → {to}"));
+                notice(ui, &format!("line endings changed from {from} to {to}"));
             }
             if *non_utf8 {
                 notice(ui, "not UTF-8, shown as Latin-1");

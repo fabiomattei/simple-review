@@ -37,6 +37,10 @@ pub struct DiffInput<'a> {
     /// Lines selected for commenting.
     pub selection: Option<(Side, u32, u32)>,
     pub threads: &'a [ThreadMark],
+    /// New static-analysis warnings: side, line, message.
+    pub warnings: &'a [(Side, u32, String)],
+    /// Added lines (new side) not covered by tests.
+    pub uncovered: &'a [u32],
 }
 
 /// A comment thread shown in the gutter.
@@ -254,6 +258,7 @@ pub fn show(
 /// What is under the pointer.
 enum Hit<'a> {
     Text { cursor: Cursor },
+    Warning { messages: Vec<&'a str> },
     Thread { id: i64 },
     Blame { commit: &'a BlameCommit },
     Other,
@@ -293,6 +298,23 @@ fn hit_test<'a>(
     {
         return (Some(row_idx), Hit::Thread { id: t.thread_id });
     }
+    let number_x = pane.blame_x + m.blame_w();
+    if (number_x..pane.numbers.first().copied().unwrap_or(number_x)).contains(&pos.x) {
+        let messages: Vec<&str> = input
+            .warnings
+            .iter()
+            .filter(|(s, l, _)| *s == side && *l == cell.line)
+            .map(|(_, _, m)| m.as_str())
+            .collect();
+        let uncovered = side == Side::New && input.uncovered.contains(&cell.line);
+        if !messages.is_empty() || uncovered {
+            let mut messages = messages;
+            if uncovered {
+                messages.push("Not covered by tests");
+            }
+            return (Some(row_idx), Hit::Warning { messages });
+        }
+    }
     if pos.x < pane.text_x {
         // Line numbers: select whole lines.
         return (Some(row_idx), Hit::Text { cursor: Cursor { side, line: cell.line, col: 0 } });
@@ -328,6 +350,13 @@ fn handle_pointer(
                 ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
                 response.clone().on_hover_text_at_pointer("Show comments");
             }
+            Hit::Warning { messages } => {
+                response.clone().on_hover_ui_at_pointer(|ui| {
+                    for m in messages {
+                        ui.label(m);
+                    }
+                });
+            }
             _ => {}
         }
     }
@@ -354,6 +383,7 @@ fn handle_pointer(
         match hit {
             Hit::Text { cursor } if shift => actions.push(Action::SelectTo(cursor)),
             Hit::Thread { id } => actions.push(Action::GoToThread(id)),
+            Hit::Warning { .. } => actions.push(Action::ShowQuality),
             Hit::Text { cursor } => {
                 actions.push(Action::SetCursor(cursor));
                 if command {
@@ -492,12 +522,33 @@ fn paint_cell(
     if !input.single {
         painter.text(pos2(pane.marker_x + 2.0, y), Align2::LEFT_CENTER, marker(cell.kind, side), m.font.clone(), pal.weak);
     }
+    paint_quality_marks(painter, m, pal, pane, rect, cell.line, side, input);
     paint_thread_marks(painter, m, pal, pane, rect, cell.line, side, input.threads);
     let (lines, hl) = match side {
         Side::Old => (input.old, input.hl_old),
         Side::New => (input.new, input.hl_new),
     };
     paint_text(painter, m, pal, pane.text_rect(rect), cell, lines, hl, h_scroll);
+}
+
+/// "!" for new warnings and a hatched bar for uncovered lines, at the left of the line numbers.
+#[allow(clippy::too_many_arguments)]
+fn paint_quality_marks(painter: &egui::Painter, m: &Metrics, pal: &Palette, pane: &Pane, rect: Rect, line: u32, side: Side, input: &DiffInput<'_>) {
+    let x = pane.blame_x + m.blame_w();
+    if side == Side::New && input.uncovered.contains(&line) {
+        let bar = Rect::from_min_size(pos2(x + 1.0, rect.min.y), vec2(3.0, rect.height()));
+        painter.rect_filled(bar, 0.0, pal.removed_inline);
+        // Dashes make the bar distinguishable without colour.
+        let mut y = rect.min.y + 1.0;
+        while y < rect.max.y {
+            painter.line_segment([pos2(bar.min.x, y), pos2(bar.max.x, y)], Stroke::new(1.0, pal.filler));
+            y += 4.0;
+        }
+    }
+    if input.warnings.iter().any(|(s, l, _)| *s == side && *l == line) {
+        painter.rect_filled(rect, 0.0, pal.warn.gamma_multiply(0.12));
+        painter.text(pos2(x + 6.0, rect.center().y), Align2::LEFT_CENTER, "!", m.font.clone(), pal.warn);
+    }
 }
 
 /// A count badge on a thread's first line and a bar along its lines.

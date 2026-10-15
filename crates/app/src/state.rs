@@ -7,6 +7,9 @@ use std::sync::Arc;
 use review_core::ObjectId;
 use review_core::diff::{DiffOptions, Row, hunk_ranges};
 use review_core::file_view::FileView;
+use review_core::analysis::AnalysisResult;
+use review_core::analysis::complexity::ComplexityChange;
+use review_core::analysis::secrets::SecretFinding;
 use review_core::blame::Blame;
 use review_core::git::{ChangeStatus, CommitInfo, FileChange, FileSide, Repo, TreeFile};
 use review_core::highlight::{Highlighted, ThemeKind};
@@ -89,6 +92,59 @@ pub enum JobResult {
     },
     /// An export finished: a message for the user, or an error.
     Exported(Result<ExportDone, String>),
+    Analysis {
+        key: AnalysisKey,
+        result: Result<Arc<AnalysisResult>, String>,
+    },
+    Secrets {
+        key: AnalysisKey,
+        findings: Vec<(String, SecretFinding)>,
+    },
+    /// Language server answers, tagged with the request they belong to.
+    LspDefinition {
+        request: u64,
+        result: Result<Vec<LspTarget>, String>,
+    },
+    LspReferences {
+        request: u64,
+        result: Result<Vec<LspTarget>, String>,
+    },
+}
+
+/// Old and new commit of a diff: what analysis results are cached under.
+pub type AnalysisKey = (Option<ObjectId>, ObjectId);
+
+pub enum AnalysisState {
+    Running,
+    Done(Arc<AnalysisResult>),
+    Failed(String),
+}
+
+/// A location from the language server, mapped back to the repository when possible.
+#[derive(Debug, Clone)]
+pub struct LspTarget {
+    /// Repository-relative path when the file is part of the commit's tree.
+    pub rel: Option<String>,
+    /// Where the file is on disk (snapshot, or the working copy's vendor/).
+    pub abs: std::path::PathBuf,
+    pub line: u32,
+    pub context: String,
+}
+
+impl LspTarget {
+    pub fn label(&self) -> String {
+        let path = self.rel.clone().unwrap_or_else(|| self.abs.display().to_string());
+        format!("{path}:{}", self.line + 1)
+    }
+}
+
+/// Signals computed for the open file.
+#[derive(Debug, Clone, Default)]
+pub struct FileQuality {
+    pub complexity: Vec<ComplexityChange>,
+    pub secrets: Vec<SecretFinding>,
+    /// Added lines (new side) not covered by tests; `None` without coverage for this file.
+    pub uncovered: Option<Vec<u32>>,
 }
 
 pub enum ExportDone {
@@ -235,6 +291,7 @@ pub struct SelectedFile {
     pub selection: Option<(Side, u32, u32)>,
     /// Comment threads placed on this view; recomputed when threads or the view change.
     pub placed: Option<(u64, Vec<PlacedThread>)>,
+    pub quality: Option<FileQuality>,
     /// Line to reveal once the view is ready.
     pub pending_line: Option<(Side, u32)>,
 }
@@ -270,6 +327,7 @@ impl SelectedFile {
             cursor: None,
             selection: None,
             placed: None,
+            quality: None,
             pending_line: None,
         }
     }
@@ -352,6 +410,7 @@ pub enum PeekTab {
     References,
     Blame,
     Comments,
+    Quality,
 }
 
 /// A version of the code: the commit whose tree a lookup runs against.
@@ -365,6 +424,9 @@ pub enum DefinitionState {
     /// Waiting for the symbol index of `version`.
     Pending { path: String, line: u32, col: u32 },
     Ready { lookup: Lookup, selected: usize },
+    /// Waiting for the language server.
+    LspPending { request: u64, path: String, line: u32, col: u32 },
+    Lsp { name: String, targets: Vec<LspTarget>, selected: usize },
     NotFound(String),
 }
 
@@ -385,6 +447,8 @@ pub struct Snippet {
 pub enum ReferencesState {
     Pending,
     Ready { target: Located, hits: Vec<RefHit> },
+    LspPending { request: u64 },
+    Lsp { name: String, targets: Vec<LspTarget> },
     NotFound(String),
 }
 
@@ -491,4 +555,10 @@ pub struct SettingsDialog {
     pub ignored_paths: String,
     pub feedback_path: String,
     pub live_refresh: bool,
+    pub trusted: bool,
+    pub coverage_path: String,
+    pub phpstan_cmd: String,
+    pub pint_cmd: String,
+    pub lsp_cmd: String,
+    pub use_lsp: bool,
 }

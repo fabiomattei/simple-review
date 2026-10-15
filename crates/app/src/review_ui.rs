@@ -543,6 +543,12 @@ impl ReviewApp {
             ignored_paths: s.ignored_paths.join("\n"),
             feedback_path: s.feedback_path.clone(),
             live_refresh: s.live_refresh,
+            trusted: s.trusted,
+            coverage_path: s.coverage_path.clone(),
+            phpstan_cmd: s.phpstan_cmd.clone(),
+            pint_cmd: s.pint_cmd.clone(),
+            lsp_cmd: s.lsp_cmd.clone(),
+            use_lsp: s.use_lsp,
         });
     }
 
@@ -554,6 +560,12 @@ impl ReviewApp {
             ignored_paths: d.ignored_paths.lines().map(str::trim).filter(|l| !l.is_empty()).map(String::from).collect(),
             feedback_path: if d.feedback_path.trim().is_empty() { "REVIEW_FEEDBACK.md".into() } else { d.feedback_path.trim().to_string() },
             live_refresh: d.live_refresh,
+            trusted: d.trusted,
+            coverage_path: d.coverage_path.trim().to_string(),
+            phpstan_cmd: d.phpstan_cmd.trim().to_string(),
+            pint_cmd: d.pint_cmd.trim().to_string(),
+            lsp_cmd: d.lsp_cmd.trim().to_string(),
+            use_lsp: d.use_lsp,
         };
         if let Some(store) = &self.store
             && let Err(e) = store.save_repo_settings(rs.repo.root(), &settings)
@@ -561,9 +573,18 @@ impl ReviewApp {
             self.error = Some(format!("{e:#}"));
         }
         let restart_watch = rs.settings.live_refresh != settings.live_refresh;
+        let tools_changed = rs.settings.trusted != settings.trusted || rs.settings.lsp_cmd != settings.lsp_cmd || rs.settings.use_lsp != settings.use_lsp;
+        let coverage_changed = rs.settings.coverage_path != settings.coverage_path;
         rs.settings = settings;
         if restart_watch {
             self.start_watcher();
+        }
+        if tools_changed {
+            self.shutdown_language_servers();
+            self.analyses.clear();
+        }
+        if coverage_changed {
+            self.load_coverage();
         }
         self.toast("Settings saved");
     }

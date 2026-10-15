@@ -99,6 +99,15 @@ impl ReviewApp {
             return;
         }
         let commit = version.commit;
+        if self.use_lsp() {
+            let request = self.lsp_request(commit, path.clone(), cursor.line, cursor.col, false);
+            self.peek.definition = Some(DefinitionPeek {
+                version,
+                state: DefinitionState::LspPending { request, path, line: cursor.line, col: cursor.col },
+                snippet: None,
+            });
+            return;
+        }
         self.peek.definition = Some(DefinitionPeek {
             version,
             state: DefinitionState::Pending { path, line: cursor.line, col: cursor.col },
@@ -114,6 +123,15 @@ impl ReviewApp {
         self.peek.open = true;
         self.peek.tab = PeekTab::References;
         let commit = version.commit;
+        if self.use_lsp() && is_php_path(&path) {
+            let request = self.lsp_request(commit, path.clone(), cursor.line, cursor.col, true);
+            self.peek.references = Some(ReferencesPeek {
+                version,
+                origin: (path, cursor.line, cursor.col),
+                state: ReferencesState::LspPending { request },
+            });
+            return;
+        }
         self.peek.references =
             Some(ReferencesPeek { version, origin: (path, cursor.line, cursor.col), state: ReferencesState::Pending });
         self.request_index(commit);
@@ -125,7 +143,7 @@ impl ReviewApp {
     }
 
     /// Finish definition/reference lookups whose index has arrived.
-    fn resolve_pending_lookups(&mut self) {
+    pub(super) fn resolve_pending_lookups(&mut self) {
         if let Some(def) = &self.peek.definition
             && let DefinitionState::Pending { path, line, col } = &def.state
             && let Some(index) = self.indexes.get(&def.version.commit)
@@ -162,6 +180,15 @@ impl ReviewApp {
 
     /// Read the selected definition's source for the peek panel.
     pub(super) fn load_snippet(&mut self) {
+        if let Some(def) = &self.peek.definition
+            && let DefinitionState::Lsp { targets, selected, .. } = &def.state
+        {
+            let snippet = targets.get(*selected).and_then(|t| self.lsp_snippet(t));
+            if let Some(def) = self.peek.definition.as_mut() {
+                def.snippet = snippet;
+            }
+            return;
+        }
         let theme = self.theme();
         let Some(rs) = self.rs.as_ref() else { return };
         let Some(def) = self.peek.definition.as_mut() else { return };
@@ -197,6 +224,13 @@ impl ReviewApp {
 
     pub(super) fn open_definition(&mut self) {
         let Some(def) = &self.peek.definition else { return };
+        if let DefinitionState::Lsp { targets, selected, .. } = &def.state {
+            let (commit, target) = (def.version.commit, targets.get(*selected).cloned());
+            if let Some(t) = target {
+                self.open_lsp_target(commit, &t);
+            }
+            return;
+        }
         let DefinitionState::Ready { lookup, selected } = &def.state else { return };
         let Some(c) = lookup.candidates.get(*selected) else { return };
         let (commit, path, line) = (def.version.commit, c.path.clone(), c.symbol.span.line);
@@ -205,6 +239,13 @@ impl ReviewApp {
 
     pub(super) fn open_reference(&mut self, i: usize) {
         let Some(refs) = &self.peek.references else { return };
+        if let ReferencesState::Lsp { targets, .. } = &refs.state {
+            let (commit, target) = (refs.version.commit, targets.get(i).cloned());
+            if let Some(t) = target {
+                self.open_lsp_target(commit, &t);
+            }
+            return;
+        }
         let ReferencesState::Ready { hits, .. } = &refs.state else { return };
         let Some(hit) = hits.get(i) else { return };
         let (commit, path, line) = (refs.version.commit, hit.path.clone(), hit.reference.span.line);

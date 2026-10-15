@@ -20,6 +20,8 @@ pub const SHORTCUTS: &[(&str, &str)] = &[
     ("c", "Comment on the selected lines (or the cursor line)"),
     (".  /  ,", "Next / previous comment thread in this file"),
     ("Cmd/Ctrl+Enter", "Save a comment"),
+    ("q", "Quality: secrets, new warnings, complexity, coverage"),
+    ("v", "Toggle the coverage overlay"),
     ("u", "Toggle split / unified view"),
     ("w", "Toggle ignore whitespace"),
     ("i", "Toggle word (intra-line) highlighting"),
