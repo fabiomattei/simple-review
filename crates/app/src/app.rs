@@ -32,7 +32,7 @@ const H_SCROLL_STEP: f32 = 60.0;
 pub struct ReviewApp {
     ctx: egui::Context,
     store: Option<Store>,
-    pool: TaskPool<JobResult>,
+    pool: crate::app::tabs::Jobs,
     notify: Notify,
     highlighter: Arc<Highlighter>,
     rs: Option<RepoState>,
@@ -76,6 +76,16 @@ pub struct ReviewApp {
     bisect: review_core::bisect::Bisect,
     bisect_verdict: Option<Result<review_core::bisect::Verdict, String>>,
     laravel: crate::state::LaravelPanel,
+    /// All tabs; the active one's slot is a placeholder, its state lives in the fields above.
+    tabs: Vec<tabs::TabState>,
+    tab_id: u64,
+    next_tab_id: u64,
+    prefs: crate::state::Prefs,
+    prefs_dialog: Option<crate::state::PrefsDialog>,
+    /// Editable copies of bookmark notes, for the Bookmarks tab.
+    bookmark_notes: Vec<String>,
+    check_updates: bool,
+    update_available: Option<crate::updater::UpdateInfo>,
 }
 
 impl ReviewApp {
@@ -98,7 +108,9 @@ impl ReviewApp {
         let blame_on = pref("blame", false);
         let blame_by_committer = pref("blame_by_committer", false);
         let coverage_on = pref("coverage", true);
+        let check_updates = pref("check_updates", false);
         let recent = store.as_ref().and_then(|s| s.recent_repos(12).ok()).unwrap_or_default();
+        let prefs = crate::state::Prefs::load(store.as_ref());
 
         // Load syntax definitions off the UI thread so the first diff doesn't pay for it.
         std::thread::spawn(Highlighter::global);
@@ -106,7 +118,7 @@ impl ReviewApp {
         let mut app = ReviewApp {
             ctx,
             store,
-            pool: TaskPool::new(workers, notify.clone()),
+            pool: tabs::Jobs::new(TaskPool::new(workers, notify.clone())),
             notify,
             highlighter: Highlighter::global(),
             rs: None,
@@ -149,9 +161,22 @@ impl ReviewApp {
             bisect: Default::default(),
             bisect_verdict: None,
             laravel: Default::default(),
+            tabs: vec![tabs::TabState::new(0)],
+            tab_id: 0,
+            next_tab_id: 1,
+            prefs,
+            prefs_dialog: None,
+            bookmark_notes: Vec::new(),
+            check_updates,
+            update_available: None,
         };
+        app.apply_prefs();
+        if check_updates {
+            app.check_for_updates(false);
+        }
+        app.restore_tabs();
         if let Some(path) = initial {
-            app.open_repo(&path);
+            app.open_repo_in_tab(&path);
         }
         app
     }
@@ -203,8 +228,6 @@ impl ReviewApp {
         self.blames = LruCache::new(64);
         self.blame_pending.clear();
         self.peek = Peek::default();
-        let name = root.file_name().map_or_else(|| root.display().to_string(), |n| n.to_string_lossy().into_owned());
-        self.ctx.send_viewport_cmd(egui::ViewportCommand::Title(format!("{name} — Simple Review")));
         let identity = repo.user_identity();
         self.rs = Some(RepoState {
             head,
@@ -213,6 +236,7 @@ impl ReviewApp {
             identity,
             threads: Vec::new(),
             threads_generation: 0,
+            bookmarks: Vec::new(),
             repo,
             settings,
             commits: Vec::new(),
@@ -230,6 +254,7 @@ impl ReviewApp {
         self.compare = None;
         self.settings_dialog = None;
         self.load_threads();
+        self.load_bookmarks();
         self.start_watcher();
         self.shutdown_language_servers();
         self.analyses.clear();
@@ -242,6 +267,7 @@ impl ReviewApp {
         self.bisect = Default::default();
         self.bisect_verdict = None;
         self.laravel = Default::default();
+        self.update_title();
     }
 
     fn select_commit(&mut self, info: CommitInfo, parent_idx: usize, path: Option<String>, push: bool) {
@@ -416,88 +442,14 @@ impl ReviewApp {
             }
         }
 
-        while let Some(result) = self.pool.try_recv() {
-            match result {
-                JobResult::Files { commit, parent, result } => self.on_files(commit, parent, result),
-                JobResult::View { key, result } => {
-                    if let Ok(view) = &result {
-                        self.view_cache.insert(key.clone(), view.clone());
-                    }
-                    let sf = self.rs.as_mut().and_then(|rs| rs.commit.as_mut()).and_then(|c| c.file.as_mut());
-                    if let Some(sf) = sf
-                        && sf.key.as_ref() == Some(&key)
-                    {
-                        match result {
-                            Ok(view) => {
-                                sf.set_view(view);
-                                if !sf.apply_pending_line(self.unified) {
-                                    sf.reveal_current_hunk(self.unified);
-                                }
-                            }
-                            Err(e) => sf.view = ViewState::Error(e),
-                        }
-                    }
-                }
-                JobResult::Highlight { key, result } => {
-                    self.hl_pending.remove(&key);
-                    if let Some(h) = result {
-                        self.hl_cache.insert(key, h);
-                    }
-                }
-                JobResult::Index { commit, result } => self.on_index(commit, result),
-                JobResult::Blame { key, result } => {
-                    self.blame_pending.remove(&key);
-                    self.blames.insert(key, result);
-                }
-                JobResult::Exported(result) => self.on_exported(result),
-                JobResult::Analysis { key, result } => {
-                    let state = match result {
-                        Ok(r) => {
-                            self.toast(format!("Analysis done: {} new warning(s)", r.introduced.len()));
-                            crate::state::AnalysisState::Done(r)
-                        }
-                        Err(e) => crate::state::AnalysisState::Failed(e),
-                    };
-                    self.analyses.insert(key, state);
-                }
-                JobResult::Secrets { key, findings } => {
-                    self.secret_pending.remove(&key);
-                    self.secret_scans.insert(key, findings);
-                }
-                JobResult::LspDefinition { request, result } => self.on_lsp_definition(request, result),
-                JobResult::Risks(found) => {
-                    for (id, r) in found {
-                        self.risk_pending.remove(&id);
-                        self.risks.insert(id, r);
-                    }
-                }
-                JobResult::Pickaxe { query, result } => {
-                    if self.history_panel.pickaxe.as_ref().is_some_and(|(q, _)| *q == query) {
-                        self.history_panel.pickaxe = Some((query, result.map_err(Some)));
-                    }
-                }
-                JobResult::LineHistory { label, result } => {
-                    if self.history_panel.lines.as_ref().is_some_and(|(l, _)| *l == label) {
-                        self.history_panel.lines = Some((label, result.map_err(Some)));
-                    }
-                }
-                JobResult::Laravel { key, result } => {
-                    self.laravel.data.insert(key, result.map_err(Some));
-                }
-                JobResult::Advisories { key, result } => {
-                    self.laravel.advisories.insert(key, result.map_err(Some));
-                }
-                JobResult::ArtisanRoutes { key, result } => {
-                    self.laravel.artisan.insert(key, result.map_err(Some));
-                }
-                JobResult::LspReferences { request, result } => self.on_lsp_references(request, result),
-                JobResult::Tree { commit, result } => {
-                    if let Some(sc) = self.rs.as_mut().and_then(|rs| rs.commit.as_mut())
-                        && sc.info.id == commit
-                    {
-                        sc.tree = Some(result);
-                    }
-                }
+        while let Some((tab, result)) = self.pool.try_recv() {
+            // Highlighting (cached by blob) and updates concern every tab, so they never wait.
+            let global = matches!(result, JobResult::Highlight { .. } | JobResult::UpdateCheck { .. } | JobResult::UpdateFailed(_));
+            if tab == self.tab_id || global {
+                self.handle_result(result);
+            } else if let Some(t) = self.tabs.iter_mut().find(|t| t.id == tab) {
+                // Finished for a tab in the background: apply when it is shown again.
+                t.deferred.push(result);
             }
         }
         self.ensure_highlighting();
@@ -509,6 +461,103 @@ impl ReviewApp {
         self.ensure_laravel();
         if self.toast.as_ref().is_some_and(|(_, at)| at.elapsed() > Duration::from_secs(6)) {
             self.toast = None;
+        }
+    }
+
+    /// Apply a finished background job to the active tab.
+    pub(crate) fn handle_result(&mut self, result: JobResult) {
+        match result {
+            JobResult::Files { commit, parent, result } => self.on_files(commit, parent, result),
+            JobResult::UpdateCheck { manual, result } => match result {
+                Ok(Some(info)) => {
+                    self.toast(format!("Version {} is available", info.version));
+                    self.update_available = Some(info);
+                }
+                Ok(None) if manual => self.toast("Simple Review is up to date."),
+                Ok(None) => {}
+                Err(e) if manual => self.error = Some(format!("Update check failed: {e}")),
+                Err(_) => {}
+            },
+            JobResult::UpdateFailed(e) => self.error = Some(format!("Update failed: {e}")),
+            JobResult::View { key, result } => {
+                if let Ok(view) = &result {
+                    self.view_cache.insert(key.clone(), view.clone());
+                }
+                let sf = self.rs.as_mut().and_then(|rs| rs.commit.as_mut()).and_then(|c| c.file.as_mut());
+                if let Some(sf) = sf
+                    && sf.key.as_ref() == Some(&key)
+                {
+                    match result {
+                        Ok(view) => {
+                            sf.set_view(view);
+                            if !sf.apply_pending_line(self.unified) {
+                                sf.reveal_current_hunk(self.unified);
+                            }
+                        }
+                        Err(e) => sf.view = ViewState::Error(e),
+                    }
+                }
+            }
+            JobResult::Highlight { key, result } => {
+                self.hl_pending.remove(&key);
+                if let Some(h) = result {
+                    self.hl_cache.insert(key, h);
+                }
+            }
+            JobResult::Index { commit, result } => self.on_index(commit, result),
+            JobResult::Blame { key, result } => {
+                self.blame_pending.remove(&key);
+                self.blames.insert(key, result);
+            }
+            JobResult::Exported(result) => self.on_exported(result),
+            JobResult::Analysis { key, result } => {
+                let state = match result {
+                    Ok(r) => {
+                        self.toast(format!("Analysis done: {} new warning(s)", r.introduced.len()));
+                        crate::state::AnalysisState::Done(r)
+                    }
+                    Err(e) => crate::state::AnalysisState::Failed(e),
+                };
+                self.analyses.insert(key, state);
+            }
+            JobResult::Secrets { key, findings } => {
+                self.secret_pending.remove(&key);
+                self.secret_scans.insert(key, findings);
+            }
+            JobResult::LspDefinition { request, result } => self.on_lsp_definition(request, result),
+            JobResult::Risks(found) => {
+                for (id, r) in found {
+                    self.risk_pending.remove(&id);
+                    self.risks.insert(id, r);
+                }
+            }
+            JobResult::Pickaxe { query, result } => {
+                if self.history_panel.pickaxe.as_ref().is_some_and(|(q, _)| *q == query) {
+                    self.history_panel.pickaxe = Some((query, result.map_err(Some)));
+                }
+            }
+            JobResult::LineHistory { label, result } => {
+                if self.history_panel.lines.as_ref().is_some_and(|(l, _)| *l == label) {
+                    self.history_panel.lines = Some((label, result.map_err(Some)));
+                }
+            }
+            JobResult::Laravel { key, result } => {
+                self.laravel.data.insert(key, result.map_err(Some));
+            }
+            JobResult::Advisories { key, result } => {
+                self.laravel.advisories.insert(key, result.map_err(Some));
+            }
+            JobResult::ArtisanRoutes { key, result } => {
+                self.laravel.artisan.insert(key, result.map_err(Some));
+            }
+            JobResult::LspReferences { request, result } => self.on_lsp_references(request, result),
+            JobResult::Tree { commit, result } => {
+                if let Some(sc) = self.rs.as_mut().and_then(|rs| rs.commit.as_mut())
+                    && sc.info.id == commit
+                {
+                    sc.tree = Some(result);
+                }
+            }
         }
     }
 
@@ -526,7 +575,13 @@ impl ReviewApp {
                 let empty = files.is_empty();
                 sc.files = FilesState::Ready(files);
                 if let Some((commit, path)) = browse {
+                    let line = self.rs.as_mut().and_then(|rs| rs.commit.as_mut()).and_then(|c| c.pending_line.take());
                     self.open_browse(commit, &path, false);
+                    let unified = self.unified;
+                    if let Some(sf) = self.current_file_mut() {
+                        sf.pending_line = line;
+                        sf.apply_pending_line(unified);
+                    }
                     return;
                 }
                 match index {
@@ -574,10 +629,29 @@ impl ReviewApp {
         match action {
             Action::OpenDialog => {
                 if let Some(path) = rfd::FileDialog::new().set_title("Open repository").pick_folder() {
-                    self.open_repo(&path);
+                    self.open_repo_in_tab(&path);
                 }
             }
-            Action::OpenRepo(path) => self.open_repo(&path),
+            Action::OpenRepo(path) => self.open_repo_in_tab(&path),
+            Action::SwitchTab(i) => self.switch_tab(i),
+            Action::CheckUpdates => self.check_for_updates(true),
+            Action::InstallUpdate => self.install_update(),
+            Action::AddBookmark => self.add_bookmark(),
+            Action::OpenBookmark(id) => self.open_bookmark(id),
+            Action::RenameBookmark(id, note) => self.rename_bookmark(id, &note),
+            Action::DeleteBookmark(id) => self.delete_bookmark(id),
+            Action::ShowBookmarks => self.show_bookmarks(),
+            Action::OpenPrefs => self.open_prefs(),
+            Action::SavePrefs => self.save_prefs(),
+            Action::CloseTab(i) => self.close_tab(i),
+            Action::NewTab => {
+                if self.rs.is_some() {
+                    self.new_tab();
+                }
+                if let Some(path) = rfd::FileDialog::new().set_title("Open repository").pick_folder() {
+                    self.open_repo_in_tab(&path);
+                }
+            }
             Action::Reload => {
                 let Some(rs) = self.rs.as_ref() else { return };
                 let root = rs.repo.root().to_path_buf();
@@ -794,6 +868,7 @@ impl ReviewApp {
             Action::OpenSettings => self.open_settings(),
             Action::SaveSettings => self.save_settings(),
             Action::CloseDialogs => {
+                self.prefs_dialog = None;
                 self.comment_editor = None;
                 self.compare = None;
                 self.settings_dialog = None;
@@ -883,7 +958,12 @@ impl ReviewApp {
 
     fn keyboard(&mut self, ctx: &egui::Context) -> Vec<Action> {
         let mut a = Vec::new();
-        if ctx.text_edit_focused() || self.comment_editor.is_some() || self.compare.is_some() || self.settings_dialog.is_some() {
+        if ctx.text_edit_focused()
+            || self.comment_editor.is_some()
+            || self.compare.is_some()
+            || self.settings_dialog.is_some()
+            || self.prefs_dialog.is_some()
+        {
             return a;
         }
         let mut scroll = None;
@@ -892,6 +972,26 @@ impl ReviewApp {
             let none = Modifiers::NONE;
             if i.consume_key(Modifiers::COMMAND, Key::O) {
                 a.push(Action::OpenDialog);
+            }
+            if i.consume_key(Modifiers::COMMAND | Modifiers::SHIFT, Key::D) {
+                a.push(Action::ShowBookmarks);
+            } else if i.consume_key(Modifiers::COMMAND, Key::D) {
+                a.push(Action::AddBookmark);
+            }
+            if i.consume_key(Modifiers::COMMAND, Key::Comma) {
+                a.push(Action::OpenPrefs);
+            }
+            if i.consume_key(Modifiers::COMMAND, Key::T) {
+                a.push(Action::NewTab);
+            }
+            if i.consume_key(Modifiers::COMMAND, Key::W) {
+                a.push(Action::CloseTab(self.active_tab_index()));
+            }
+            if i.consume_key(Modifiers::CTRL | Modifiers::SHIFT, Key::Tab) {
+                let n = self.tabs.len();
+                a.push(Action::SwitchTab((self.active_tab_index() + n - 1) % n));
+            } else if i.consume_key(Modifiers::CTRL, Key::Tab) {
+                a.push(Action::SwitchTab((self.active_tab_index() + 1) % self.tabs.len()));
             }
             if i.consume_key(Modifiers::ALT, Key::ArrowLeft) {
                 a.push(Action::Back);
@@ -1154,7 +1254,8 @@ impl ReviewApp {
                         trusted,
                     });
                     let laravel = laravel_view.map(|v| (self.laravel.tab, &mut self.laravel.route_filter, v));
-                    ui::peek::show(ui, &self.peek, &info, comments.as_ref(), quality.as_ref(), Some((&mut self.history_panel, has_file)), laravel, actions)
+                    let bookmarks = Some((rs.bookmarks.as_slice(), &mut self.bookmark_notes));
+                    ui::peek::show(ui, &self.peek, &info, comments.as_ref(), quality.as_ref(), Some((&mut self.history_panel, has_file)), laravel, bookmarks, actions)
                 });
         }
 
@@ -1267,7 +1368,7 @@ fn request_more(rs: &mut RepoState) {
 
 /// Start computing the view for `sf`, or take it from the cache.
 fn request_view(
-    pool: &TaskPool<JobResult>,
+    pool: &tabs::Jobs,
     repo: &Repo,
     sf: &mut SelectedFile,
     opts: DiffOptions,
@@ -1315,10 +1416,15 @@ impl eframe::App for ReviewApp {
             blame_on: self.blame_on,
             blame_by_committer: self.blame_by_committer,
             range: self.rs.as_ref().and_then(|rs| rs.range.as_ref()).map(|r| r.label.clone()),
+            update: self.update_available.as_ref().map(|u| (u.version.clone(), u.notes.clone().unwrap_or_default())),
             open_comments: self.rs.as_ref().map_or(0, |rs| {
                 rs.threads.iter().filter(|t| t.status == review_core::review::ThreadStatus::Open).count()
             }),
         };
+        let (tab_labels, active_tab) = self.tab_labels();
+        if self.rs.is_some() || tab_labels.len() > 1 {
+            egui::Panel::top("tab_strip").show(ui, |ui| ui::header::tab_strip(ui, &tab_labels, active_tab, &mut actions));
+        }
         egui::Panel::top("toolbar").show(ui, |ui| {
             ui.add_space(3.0);
             ui::header::toolbar(ui, &toolbar, &mut actions);
@@ -1354,6 +1460,10 @@ impl eframe::App for ReviewApp {
         if let Some(d) = self.settings_dialog.as_mut() {
             ui::dialogs::settings(&ctx, d, &mut actions);
         }
+        if let Some(d) = self.prefs_dialog.as_mut() {
+            ui::dialogs::prefs(&ctx, d, &mut actions);
+        }
+        self.track_zoom();
 
         for action in actions {
             self.apply(action);
@@ -1372,6 +1482,12 @@ mod quality_ui;
 
 #[path = "history_ui.rs"]
 mod history_ui;
+
+#[path = "tabs.rs"]
+pub(crate) mod tabs;
+
+#[path = "prefs_ui.rs"]
+mod prefs_ui;
 
 #[cfg(test)]
 #[path = "smoke_test.rs"]

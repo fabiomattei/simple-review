@@ -3,6 +3,7 @@ name = "simple-review"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+description = "Review code changes commit by commit"
 
 [dependencies]
 review-core = { path = "../core" }
@@ -12,7 +13,37 @@ eframe.workspace = true
 egui.workspace = true
 rfd.workspace = true
 pulldown-cmark = { version = "0.13", default-features = false }
+cargo-packager-updater = { version = "0.2", optional = true }
 
 [dev-dependencies]
 egui_kittest = { version = "0.36", features = ["wgpu", "snapshot", "eframe"] }
 tempfile.workspace = true
+
+[features]
+# Auto-update support; release builds enable it (see docs/RELEASING.md).
+updater = ["dep:cargo-packager-updater"]
+
+# `cargo packager --release` (from crates/app) builds the installers into target/packages.
+[package.metadata.packager]
+product-name = "Simple Review"
+identifier = "dev.simple-review.app"
+description = "Review code changes commit by commit"
+category = "DeveloperTool"
+authors = ["Fabio Mattei"]
+copyright = "Copyright © 2026 Fabio Mattei"
+before-packaging-command = "cargo build --release -p simple-review --features updater"
+out-dir = "../../target/packages"
+binaries-dir = "../../target/release"
+binaries = [{ path = "simple-review", main = true }]
+icons = ["icons/32x32.png", "icons/128x128.png", "icons/icon.png"]
+formats = ["app", "dmg", "wix", "nsis", "appimage", "deb"]
+
+[package.metadata.packager.macos]
+minimum-system-version = "11.0"
+
+[package.metadata.packager.deb]
+depends = ["git", "libgtk-3-0"]
+
+[package.metadata.packager.windows]
+digest-algorithm = "sha256"
+timestamp-url = "http://timestamp.digicert.com"

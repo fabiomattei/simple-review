@@ -110,6 +110,12 @@ pub enum JobResult {
         result: Result<Vec<LspTarget>, String>,
     },
     Risks(Vec<(ObjectId, Vec<review_core::laravel::risk::Risk>)>),
+    UpdateCheck {
+        /// The user asked, so "up to date" is worth saying.
+        manual: bool,
+        result: Result<Option<crate::updater::UpdateInfo>, String>,
+    },
+    UpdateFailed(String),
     Pickaxe {
         query: String,
         result: Result<Vec<review_core::history::PickaxeHit>, String>,
@@ -248,6 +254,7 @@ pub struct RepoState {
     pub threads: Vec<Thread>,
     /// Bumped whenever `threads` is reloaded, so cached placements can be refreshed.
     pub threads_generation: u64,
+    pub bookmarks: Vec<review_core::review::bookmarks::Bookmark>,
 }
 
 impl RepoState {
@@ -486,6 +493,7 @@ pub enum PeekTab {
     Quality,
     History,
     Laravel,
+    Bookmarks,
 }
 
 /// A version of the code: the commit whose tree a lookup runs against.
@@ -636,4 +644,22 @@ pub struct SettingsDialog {
     pub pint_cmd: String,
     pub lsp_cmd: String,
     pub use_lsp: bool,
+}
+
+/// Global appearance preferences.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Prefs {
+    pub theme: egui::ThemePreference,
+    /// UI zoom (Cmd/Ctrl +/−).
+    pub zoom: f32,
+    /// Code font size in points (before zoom).
+    pub code_font: f32,
+}
+
+pub struct PrefsDialog {
+    pub prefs: Prefs,
+    pub check_updates: bool,
+    pub unified: bool,
+    pub blame_on: bool,
+    pub coverage_on: bool,
 }

@@ -1,0 +1,92 @@
+name: Release
+
+# Push a tag like v0.2.0 to build signed installers for every platform and a draft GitHub
+# release with the update manifest. See docs/RELEASING.md for the secrets this uses.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  CI: "true"
+
+jobs:
+  package:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: macos-14, platform: macos-aarch64, formats: "app,dmg" }
+          - { os: macos-13, platform: macos-x86_64, formats: "app,dmg" }
+          - { os: windows-latest, platform: windows-x86_64, formats: "wix,nsis" }
+          - { os: ubuntu-22.04, platform: linux-x86_64, formats: "appimage,deb" }
+    runs-on: ${{ matrix.os }}
+    env:
+      # Baked into the binary: where to look for updates and the key that signs them.
+      SIMPLE_REVIEW_UPDATE_ENDPOINT: ${{ vars.UPDATE_ENDPOINT }}
+      SIMPLE_REVIEW_UPDATE_PUBKEY: ${{ vars.UPDATE_PUBKEY }}
+      # Signs the update bundles (.sig files).
+      CARGO_PACKAGER_SIGN_PRIVATE_KEY: ${{ secrets.UPDATER_PRIVATE_KEY }}
+      CARGO_PACKAGER_SIGN_PRIVATE_KEY_PASSWORD: ${{ secrets.UPDATER_PRIVATE_KEY_PASSWORD }}
+      # macOS code signing and notarization (read by cargo-packager).
+      APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+      APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+      APPLE_ID: ${{ secrets.APPLE_ID }}
+      APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+      APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Linux libraries
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libgtk-3-dev libxkbcommon-dev libwayland-dev
+      - name: Install cargo-packager
+        run: cargo install cargo-packager --locked --version 0.11.8
+      - name: macOS signing identity
+        if: runner.os == 'macOS' && env.APPLE_CERTIFICATE != ''
+        run: echo "APPLE_SIGNING_IDENTITY=${{ secrets.APPLE_SIGNING_IDENTITY }}" >> "$GITHUB_ENV"
+      - name: Windows code-signing certificate
+        if: runner.os == 'Windows' && env.WINDOWS_CERTIFICATE != ''
+        shell: pwsh
+        env:
+          WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
+          WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+        run: |
+          $bytes = [Convert]::FromBase64String($env:WINDOWS_CERTIFICATE)
+          [IO.File]::WriteAllBytes("cert.pfx", $bytes)
+          $cert = Import-PfxCertificate -FilePath cert.pfx -CertStoreLocation Cert:\CurrentUser\My -Password (ConvertTo-SecureString $env:WINDOWS_CERTIFICATE_PASSWORD -AsPlainText -Force)
+          Remove-Item cert.pfx
+          # cargo-packager signs with the certificate whose thumbprint is configured.
+          Add-Content -Path crates/app/Cargo.toml -Value "certificate-thumbprint = `"$($cert.Thumbprint)`""
+      - name: Package
+        working-directory: crates/app
+        run: cargo packager --release --formats ${{ matrix.formats }}
+      - name: Collect artifacts
+        shell: bash
+        run: python3 scripts/collect_artifacts.py target/packages dist "${{ matrix.platform }}" "${GITHUB_REF_NAME}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.platform }}
+          path: dist/*
+
+  release:
+    needs: package
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Update manifest
+        run: |
+          python3 scripts/update_manifest.py dist "${GITHUB_REF_NAME}" \
+            "https://github.com/${GITHUB_REPOSITORY}/releases/download/${GITHUB_REF_NAME}" > dist/latest.json
+      - uses: softprops/action-gh-release@v2
+        with:
+          draft: true
+          files: dist/*

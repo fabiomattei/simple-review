@@ -120,6 +120,17 @@ const MIGRATIONS: &[&str] = &[
          created_at INTEGER NOT NULL,
          updated_at INTEGER NOT NULL);
      CREATE INDEX comments_by_thread ON comments (thread_id);",
+    "CREATE TABLE bookmarks (
+         id INTEGER PRIMARY KEY,
+         repo TEXT NOT NULL,
+         commit_id TEXT NOT NULL,
+         version_id TEXT NOT NULL,
+         path TEXT NOT NULL,
+         side TEXT NOT NULL CHECK (side IN ('old', 'new')),
+         line INTEGER NOT NULL,
+         note TEXT NOT NULL,
+         created_at INTEGER NOT NULL);
+     CREATE INDEX bookmarks_by_repo ON bookmarks (repo);",
 ];
 
 /// Current Unix time in seconds.

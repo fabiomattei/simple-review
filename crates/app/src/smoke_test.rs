@@ -46,7 +46,7 @@ fn current_summary(app: &ReviewApp) -> Option<String> {
 }
 
 fn snapshot(harness: &mut Harness<'_, ReviewApp>, name: &str) {
-    let Some(dir) = std::env::var_os("SNAPSHOT_DIR") else { return };
+    let Some(dir) = std::env::var_os("SNAPSHOT_DIR").filter(|d| !d.is_empty()) else { return };
     let image = harness.render().expect("render");
     image.save(std::path::Path::new(&dir).join(format!("{name}.png"))).expect("save snapshot");
 }
@@ -597,4 +597,85 @@ fn history_bisect_and_laravel() {
     let cursor = harness.state().rs.as_ref().unwrap().commit.as_ref().unwrap().file.as_ref().unwrap().cursor.unwrap();
     let (index_line, _) = line_of(harness.state(), Side::New, "function index");
     assert_eq!(cursor.line, index_line);
+}
+
+#[test]
+fn tabs_bookmarks_and_preferences() {
+    let tmp = tempfile::tempdir().unwrap();
+    let a = fixture::build(&tmp.path().join("shop")).unwrap();
+    let b = fixture::build(&tmp.path().join("other")).unwrap();
+    let db = tmp.path().join("settings.sqlite3");
+    let (pa, pb, db1) = (a.path.clone(), b.path.clone(), db.clone());
+    let mut harness = Harness::builder()
+        .with_size(egui::vec2(1400.0, 900.0))
+        .wgpu()
+        .build_eframe(move |cc| ReviewApp::with_store(cc, Store::open(&db1), Some(pa)));
+    wait_until(&mut harness, "first repo", view_ready);
+
+    // A second repository opens in its own tab; the first keeps its state.
+    select_summary(&mut harness, "Move round()");
+    wait_until(&mut harness, "move diff", |app| file_ready(app, "app/Services/InvoiceService.php"));
+    harness.state_mut().apply(Action::OpenRepo(pb.clone()));
+    wait_until(&mut harness, "second repo", view_ready);
+    assert_eq!(harness.state().tab_labels(), (vec!["shop".to_string(), "other".to_string()], 1));
+    assert_eq!(current_summary(harness.state()).as_deref(), Some("Convert routes to CRLF"));
+    // Select a commit in tab 2 and switch away before its files arrive: the result waits.
+    select_summary(&mut harness, "Add volume discount");
+    harness.state_mut().apply(Action::SwitchTab(0));
+    assert_eq!(current_summary(harness.state()).as_deref(), Some("Move round() below forUser()"));
+    harness.run_steps(5);
+    harness.state_mut().apply(Action::SwitchTab(1));
+    wait_until(&mut harness, "deferred result", |app| file_ready(app, "app/Services/InvoiceService.php"));
+    assert_eq!(current_summary(harness.state()).as_deref(), Some("Add volume discount"));
+    // Opening an already open repository switches to its tab.
+    harness.state_mut().apply(Action::OpenRepo(a.path.clone()));
+    assert_eq!(harness.state().tab_labels().1, 0);
+
+    // Bookmark a line in an older commit, move elsewhere, and come back through the bookmark.
+    let (line, _) = line_of(harness.state(), Side::New, "private function round");
+    harness.state_mut().apply(Action::SetCursor(Cursor { side: Side::New, line, col: 0 }));
+    harness.key_press_modifiers(egui::Modifiers::COMMAND, Key::D);
+    harness.run_steps(1);
+    let bookmark = harness.state().rs.as_ref().unwrap().bookmarks[0].clone();
+    assert_eq!(bookmark.note, "private function round(float $value): float");
+    select_summary(&mut harness, "Convert routes to CRLF");
+    wait_until(&mut harness, "other commit", |app| file_ready(app, "routes/web.php"));
+    harness.state_mut().apply(Action::OpenBookmark(bookmark.id));
+    wait_until(&mut harness, "bookmark", |app| file_ready(app, "app/Services/InvoiceService.php"));
+    harness.run_steps(2);
+    let cursor = harness.state().rs.as_ref().unwrap().commit.as_ref().unwrap().file.as_ref().unwrap().cursor.unwrap();
+    assert_eq!((cursor.side, cursor.line), (Side::New, line));
+    harness.state_mut().apply(Action::RenameBookmark(bookmark.id, "round helper".into()));
+    assert_eq!(harness.state().rs.as_ref().unwrap().bookmarks[0].note, "round helper");
+
+    // Preferences: theme, zoom and code font apply now and survive a restart.
+    harness.state_mut().apply(Action::OpenPrefs);
+    {
+        let d = harness.state_mut().prefs_dialog.as_mut().unwrap();
+        d.prefs.theme = egui::ThemePreference::Light;
+        d.prefs.code_font = 16.0;
+        d.unified = true;
+    }
+    harness.state_mut().apply(Action::SavePrefs);
+    harness.run_steps(2);
+    let mono = harness.ctx.global_style().text_styles[&egui::TextStyle::Monospace].size;
+    assert_eq!(mono, 16.0);
+    assert!(!harness.ctx.global_style().visuals.dark_mode);
+    harness.state_mut().apply(Action::ShowBookmarks);
+    wait_until(&mut harness, "highlighting", |app| app.hl_pending.is_empty());
+    snapshot(&mut harness, "light_unified_bookmarks");
+    drop(harness);
+
+    // Restart: both tabs, the active one, and the preferences come back.
+    let mut harness = Harness::builder()
+        .with_size(egui::vec2(1400.0, 900.0))
+        .wgpu()
+        .build_eframe(move |cc| ReviewApp::with_store(cc, Store::open(&db), None));
+    wait_until(&mut harness, "restored tabs", |app| app.tabs.len() == 2 && view_ready(app));
+    assert_eq!(harness.state().tab_labels(), (vec!["shop".to_string(), "other".to_string()], 0));
+    assert!(harness.state().unified);
+    assert_eq!(harness.state().prefs.code_font, 16.0);
+    harness.state_mut().apply(Action::CloseTab(0));
+    assert_eq!(harness.state().tab_labels(), (vec!["other".to_string()], 0));
+    assert_eq!(harness.state().rs.as_ref().unwrap().bookmarks.len(), 0, "bookmarks are per repository");
 }

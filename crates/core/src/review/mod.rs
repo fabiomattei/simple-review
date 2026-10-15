@@ -1,6 +1,7 @@
 //! Review comments with re-anchoring, per-file review state, and Markdown export.
 
 pub mod anchor;
+pub mod bookmarks;
 pub mod export;
 pub mod model;
 pub mod store;

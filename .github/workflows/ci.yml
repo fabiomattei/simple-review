@@ -1,0 +1,37 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-14, ubuntu-22.04, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Linux libraries
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libgtk-3-dev libxkbcommon-dev libwayland-dev mesa-vulkan-drivers
+      - name: Git identity for the fixture repository
+        run: |
+          git config --global user.name CI
+          git config --global user.email ci@example.com
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo clippy --all-targets --features simple-review/updater -- -D warnings
+      # Core tests everywhere; the headless UI tests need a GPU or a software renderer.
+      - run: cargo test -p review-core
+      - name: UI smoke tests
+        if: runner.os != 'Windows'
+        run: cargo test -p simple-review

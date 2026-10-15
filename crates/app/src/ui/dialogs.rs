@@ -3,7 +3,7 @@
 use egui::{Key, Modifiers, RichText};
 
 use super::{Action, markdown};
-use crate::state::{CommentEditor, CompareDialog, SettingsDialog};
+use crate::state::{CommentEditor, CompareDialog, PrefsDialog, SettingsDialog};
 
 pub fn comment_editor(ctx: &egui::Context, editor: &mut CommentEditor, actions: &mut Vec<Action>) {
     let mut open = true;
@@ -170,6 +170,69 @@ pub fn settings(ctx: &egui::Context, d: &mut SettingsDialog, actions: &mut Vec<A
             ui.horizontal(|ui| {
                 if ui.button("Save").clicked() {
                     actions.push(Action::SaveSettings);
+                }
+                if ui.button("Cancel").clicked() {
+                    actions.push(Action::CloseDialogs);
+                }
+            });
+        });
+    if !open || ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape)) {
+        actions.push(Action::CloseDialogs);
+    }
+}
+
+pub fn prefs(ctx: &egui::Context, d: &mut PrefsDialog, actions: &mut Vec<Action>) {
+    let mut open = true;
+    egui::Window::new("Preferences")
+        .open(&mut open)
+        .collapsible(false)
+        .default_width(380.0)
+        .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+        .show(ctx, |ui| {
+            egui::Grid::new("prefs_grid").num_columns(2).spacing([12.0, 8.0]).show(ui, |ui| {
+                ui.label("Theme");
+                ui.horizontal(|ui| {
+                    ui.selectable_value(&mut d.prefs.theme, egui::ThemePreference::System, "System");
+                    ui.selectable_value(&mut d.prefs.theme, egui::ThemePreference::Light, "Light");
+                    ui.selectable_value(&mut d.prefs.theme, egui::ThemePreference::Dark, "Dark");
+                });
+                ui.end_row();
+                ui.label("Interface zoom");
+                ui.add(egui::Slider::new(&mut d.prefs.zoom, 0.6..=2.0).step_by(0.05).suffix("×"))
+                    .on_hover_text("Also Cmd/Ctrl + and −");
+                ui.end_row();
+                ui.label("Code font size");
+                ui.add(egui::Slider::new(&mut d.prefs.code_font, 9.0..=24.0).step_by(0.5).suffix(" pt"));
+                ui.end_row();
+                ui.label("Diff layout");
+                ui.horizontal(|ui| {
+                    ui.selectable_value(&mut d.unified, false, "Split");
+                    ui.selectable_value(&mut d.unified, true, "Unified");
+                });
+                ui.end_row();
+                ui.label("Blame gutter");
+                ui.checkbox(&mut d.blame_on, "Show by default");
+                ui.end_row();
+                ui.label("Coverage overlay");
+                ui.checkbox(&mut d.coverage_on, "Show when a report is available");
+                ui.end_row();
+                ui.label("Updates");
+                ui.vertical(|ui| {
+                    let available = crate::updater::available();
+                    ui.add_enabled(available, egui::Checkbox::new(&mut d.check_updates, "Check for updates at startup"));
+                    if available {
+                        if ui.small_button("Check now").clicked() {
+                            actions.push(Action::CheckUpdates);
+                        }
+                    } else {
+                        ui.weak("This build has no update channel.");
+                    }
+                });
+                ui.end_row();
+            });
+            ui.horizontal(|ui| {
+                if ui.button("Save").clicked() {
+                    actions.push(Action::SavePrefs);
                 }
                 if ui.button("Cancel").clicked() {
                     actions.push(Action::CloseDialogs);

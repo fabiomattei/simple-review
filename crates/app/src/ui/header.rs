@@ -22,6 +22,8 @@ pub struct ToolbarState<'a> {
     /// Label of the range under review, if any.
     pub range: Option<String>,
     pub open_comments: usize,
+    /// A newer version that can be installed, with its release notes.
+    pub update: Option<(String, String)>,
 }
 
 pub fn toolbar(ui: &mut Ui, s: &ToolbarState<'_>, actions: &mut Vec<Action>) {
@@ -88,7 +90,7 @@ pub fn toolbar(ui: &mut Ui, s: &ToolbarState<'_>, actions: &mut Vec<Action>) {
                 }
                 ui.weak("Nothing is checked out; test each suggested commit yourself.");
             });
-            if ui.button("Settings").clicked() {
+            if ui.button("Settings").on_hover_text("Settings for this repository").clicked() {
                 actions.push(Action::OpenSettings);
             }
         }
@@ -129,6 +131,17 @@ pub fn toolbar(ui: &mut Ui, s: &ToolbarState<'_>, actions: &mut Vec<Action>) {
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             if ui.button("?").on_hover_text("Keyboard shortcuts (?)").clicked() {
                 actions.push(Action::ToggleHelp);
+            }
+            if let Some((version, notes)) = &s.update
+                && ui
+                    .button(RichText::new(format!("Update to {version}")).color(palette(ui).accent))
+                    .on_hover_text(format!("Download, install and restart.\n\n{notes}"))
+                    .clicked()
+            {
+                actions.push(Action::InstallUpdate);
+            }
+            if ui.button("Preferences").on_hover_text("Theme, zoom, font size, defaults (Cmd/Ctrl+,)").clicked() {
+                actions.push(Action::OpenPrefs);
             }
         });
     });
@@ -285,5 +298,31 @@ pub fn bisect_bar(ui: &mut Ui, verdict: &Result<review_core::bisect::Verdict, St
                 actions.push(Action::BisectReset);
             }
         });
+    });
+}
+
+pub fn tab_strip(ui: &mut Ui, labels: &[String], active: usize, actions: &mut Vec<Action>) {
+    ui.horizontal(|ui| {
+        for (i, label) in labels.iter().enumerate() {
+            let selected = i == active;
+            egui::Frame::new()
+                .fill(if selected { ui.visuals().selection.bg_fill } else { ui.visuals().faint_bg_color })
+                .corner_radius(4.0)
+                .inner_margin(egui::Margin::symmetric(6, 2))
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        let text = if selected { RichText::new(label).strong() } else { RichText::new(label) };
+                        if ui.add(egui::Label::new(text).sense(egui::Sense::click())).clicked() {
+                            actions.push(Action::SwitchTab(i));
+                        }
+                        if ui.small_button("×").on_hover_text("Close tab (Cmd/Ctrl+W)").clicked() {
+                            actions.push(Action::CloseTab(i));
+                        }
+                    });
+                });
+        }
+        if ui.small_button("+").on_hover_text("Open a repository in a new tab (Cmd/Ctrl+T)").clicked() {
+            actions.push(Action::NewTab);
+        }
     });
 }

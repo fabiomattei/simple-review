@@ -1,6 +1,7 @@
 //! Widgets. They read state and report what the user did as [`Action`]s; the app applies them.
 
 pub mod comments;
+pub mod bookmarks;
 pub mod commits;
 pub mod dialogs;
 pub mod diff;
@@ -25,6 +26,18 @@ use crate::state::{CommentScope, Cursor, PeekTab, StatusFilter};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Action {
+    CheckUpdates,
+    InstallUpdate,
+    AddBookmark,
+    OpenBookmark(i64),
+    RenameBookmark(i64, String),
+    DeleteBookmark(i64),
+    ShowBookmarks,
+    OpenPrefs,
+    SavePrefs,
+    SwitchTab(usize),
+    CloseTab(usize),
+    NewTab,
     ComputeRisks(Vec<ObjectId>),
     PickaxeSearch,
     LineHistory,
