@@ -104,6 +104,14 @@ pub struct FileSide {
     pub entry: EntryType,
 }
 
+/// A file in a commit's tree.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TreeFile {
+    pub path: String,
+    pub id: ObjectId,
+    pub entry: EntryType,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileChange {
     pub status: ChangeStatus,
@@ -185,10 +193,11 @@ impl Repo {
             .rev_walk([tip])
             .sorting(Sorting::ByCommitTime(CommitTimeOrder::NewestFirst))
             .all()?;
+        let mailmap = repo.open_mailmap();
         for info in walk {
             let info = info?;
             let commit = repo.find_commit(info.id)?;
-            if f(commit_info(&commit)?).is_break() {
+            if f(commit_info(&commit, &mailmap)?).is_break() {
                 break;
             }
         }
@@ -197,7 +206,7 @@ impl Repo {
 
     pub fn commit(&self, id: ObjectId) -> Result<CommitInfo> {
         let repo = self.local();
-        commit_info(&repo.find_commit(id)?)
+        commit_info(&repo.find_commit(id)?, &repo.open_mailmap())
     }
 
     /// Files changed between `parent` (or the empty tree) and `commit`, with renames detected.
@@ -215,6 +224,33 @@ impl Repo {
         Ok(out)
     }
 
+    /// Every file (not directory) in the tree of `commit`, sorted by path.
+    pub fn list_files(&self, commit: ObjectId) -> Result<Vec<TreeFile>> {
+        let repo = self.local();
+        let tree = repo.find_commit(commit)?.tree()?;
+        let mut files: Vec<TreeFile> = tree
+            .traverse()
+            .breadthfirst
+            .files()?
+            .into_iter()
+            .filter(|e| !e.mode.is_tree())
+            .map(|e| TreeFile { path: e.filepath.to_str_lossy().into_owned(), id: e.oid, entry: e.mode.kind().into() })
+            .collect();
+        files.sort_by(|a, b| a.path.cmp(&b.path));
+        Ok(files)
+    }
+
+    /// The file at `path` in the tree of `commit`, if any.
+    pub fn find_file(&self, commit: ObjectId, path: &str) -> Result<Option<TreeFile>> {
+        let repo = self.local();
+        let tree = repo.find_commit(commit)?.tree()?;
+        Ok(tree.lookup_entry_by_path(path)?.filter(|e| !e.mode().is_tree()).map(|e| TreeFile {
+            path: path.to_string(),
+            id: e.object_id(),
+            entry: e.mode().kind().into(),
+        }))
+    }
+
     pub fn read_blob(&self, id: ObjectId) -> Result<Vec<u8>> {
         let repo = self.local();
         let mut blob = repo.find_blob(id)?;
@@ -228,18 +264,18 @@ impl Repo {
     }
 }
 
-fn signature(sig: gix::actor::SignatureRef<'_>) -> Signature {
+/// Convert a signature, applying `.mailmap` so one person has one identity.
+fn signature(sig: gix::actor::SignatureRef<'_>, mailmap: &gix::mailmap::Snapshot) -> Signature {
     let sig = sig.trim();
     let time = sig.time().unwrap_or_default();
-    Signature {
-        name: sig.name.to_str_lossy().into_owned(),
-        email: sig.email.to_str_lossy().into_owned(),
-        time: time.seconds,
-        offset: time.offset,
-    }
+    let (name, email) = match mailmap.try_resolve(sig) {
+        Some(mapped) => (mapped.name.to_str_lossy().into_owned(), mapped.email.to_str_lossy().into_owned()),
+        None => (sig.name.to_str_lossy().into_owned(), sig.email.to_str_lossy().into_owned()),
+    };
+    Signature { name, email, time: time.seconds, offset: time.offset }
 }
 
-fn commit_info(commit: &gix::Commit<'_>) -> Result<CommitInfo> {
+fn commit_info(commit: &gix::Commit<'_>, mailmap: &gix::mailmap::Snapshot) -> Result<CommitInfo> {
     let decoded = commit.decode()?;
     let message = decoded.message.to_str_lossy().into_owned();
     let co_authors = co_authors(&message);
@@ -249,8 +285,8 @@ fn commit_info(commit: &gix::Commit<'_>) -> Result<CommitInfo> {
         parents: decoded.parents().collect(),
         summary: decoded.message_summary().to_str_lossy().into_owned(),
         message,
-        author: signature(decoded.author()?),
-        committer: signature(decoded.committer()?),
+        author: signature(decoded.author()?, mailmap),
+        committer: signature(decoded.committer()?, mailmap),
         co_authors,
         ai_assisted,
     })

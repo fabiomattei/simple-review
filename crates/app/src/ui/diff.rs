@@ -3,14 +3,21 @@
 //! Rows are painted directly (only the visible ones), so both panes share one vertical scroll
 //! position and stay aligned. Horizontal scrolling is shared too.
 
+use std::hash::{Hash, Hasher};
 use std::ops::Range;
 
 use egui::text::LayoutJob;
-use egui::{Align2, Color32, FontId, Pos2, Rect, Sense, Stroke, TextFormat, TextStyle, Ui, UiBuilder, Vec2, pos2, vec2};
+use egui::{
+    Align2, Color32, CursorIcon, FontId, Pos2, Rect, Sense, Stroke, TextFormat, TextStyle, Ui, UiBuilder, Vec2, pos2,
+    vec2,
+};
+use review_core::blame::{Blame, BlameCommit};
 use review_core::diff::{Cell, LineKind, Row};
+use review_core::git::format_time;
 use review_core::highlight::{Highlighted, Span};
 
 use super::{Action, Palette, palette};
+use crate::state::{Cursor, Side};
 
 pub struct DiffInput<'a> {
     pub rows: &'a [Row],
@@ -20,8 +27,20 @@ pub struct DiffInput<'a> {
     pub hl_old: Option<&'a Highlighted>,
     pub hl_new: Option<&'a Highlighted>,
     pub unified: bool,
+    /// One pane with one line-number column (browsing a file, not a diff).
+    pub single: bool,
     pub current_hunk: Option<usize>,
     pub max_line_chars: usize,
+    /// `Some` when the blame gutter is shown; a side's blame may still be loading.
+    pub blame: Option<BlameInput<'a>>,
+    pub cursor: Option<Cursor>,
+}
+
+#[derive(Clone, Copy)]
+pub struct BlameInput<'a> {
+    pub old: Option<&'a Blame>,
+    pub new: Option<&'a Blame>,
+    pub by_committer: bool,
 }
 
 /// Keyboard scrolling requested by the app.
@@ -37,11 +56,92 @@ const OVERVIEW_WIDTH: f32 = 14.0;
 /// Characters shown per line; the rest is cut to keep layout cheap on minified files.
 const MAX_SHOWN_CHARS: usize = 1500;
 const TAB: &str = "    ";
+const TAB_WIDTH: usize = 4;
+/// Blame gutter: two initials and two marker characters.
+const BLAME_CHARS: f32 = 4.0;
 
 struct Metrics {
     font: FontId,
     char_w: f32,
     digits: usize,
+    blame: bool,
+}
+
+impl Metrics {
+    fn blame_w(&self) -> f32 {
+        if self.blame { BLAME_CHARS * self.char_w + 10.0 } else { 0.0 }
+    }
+
+    fn number_w(&self) -> f32 {
+        self.digits as f32 * self.char_w + 14.0
+    }
+
+    fn marker_w(&self) -> f32 {
+        self.char_w + 8.0
+    }
+}
+
+/// Horizontal layout of one pane.
+struct Pane {
+    rect: Rect,
+    blame_x: f32,
+    /// Right edges of the line-number columns.
+    numbers: Vec<f32>,
+    marker_x: f32,
+    text_x: f32,
+}
+
+impl Pane {
+    fn new(m: &Metrics, rect: Rect, number_columns: usize, marker: bool) -> Self {
+        let blame_x = rect.min.x;
+        let mut x = blame_x + m.blame_w();
+        let numbers = (0..number_columns)
+            .map(|_| {
+                x += m.number_w();
+                x - 8.0
+            })
+            .collect();
+        let marker_x = x;
+        if marker {
+            x += m.marker_w();
+        }
+        Pane { rect, blame_x, numbers, marker_x, text_x: x }
+    }
+
+    fn text_rect(&self, row: Rect) -> Rect {
+        Rect::from_min_max(pos2(self.text_x, row.min.y), pos2(self.rect.max.x, row.max.y))
+    }
+}
+
+/// The panes for a given content rect.
+fn panes(m: &Metrics, rect: Rect, input: &DiffInput<'_>) -> Vec<(Side, Pane)> {
+    if input.single {
+        vec![(Side::New, Pane::new(m, rect, 1, false))]
+    } else if input.unified {
+        vec![(Side::New, Pane::new(m, rect, 2, true))]
+    } else {
+        let half = rect.width() / 2.0;
+        let left = Rect::from_min_size(rect.min, vec2(half, rect.height()));
+        let right = Rect::from_min_max(pos2(rect.min.x + half, rect.min.y), rect.max);
+        vec![(Side::Old, Pane::new(m, left, 1, true)), (Side::New, Pane::new(m, right, 1, true))]
+    }
+}
+
+/// The cell a pane shows for a row, with the side it belongs to.
+fn cell_for<'r>(row: &'r Row, pane_side: Side, input: &DiffInput<'_>) -> Option<(&'r Cell, Side)> {
+    if input.single || input.unified {
+        // Context rows carry both sides; show the new one. Change rows carry exactly one side.
+        match (&row.left, &row.right) {
+            (_, Some(r)) => Some((r, Side::New)),
+            (Some(l), None) => Some((l, Side::Old)),
+            _ => None,
+        }
+    } else {
+        match pane_side {
+            Side::Old => row.left.as_ref().map(|c| (c, Side::Old)),
+            Side::New => row.right.as_ref().map(|c| (c, Side::New)),
+        }
+    }
 }
 
 pub fn show(
@@ -56,7 +156,7 @@ pub fn show(
     let font = TextStyle::Monospace.resolve(ui.style());
     let (row_h, char_w) = ui.fonts_mut(|f| (f.row_height(&font) + 3.0, f.glyph_width(&font, '0')));
     let digits = input.old.len().max(input.new.len()).max(1).to_string().len();
-    let m = Metrics { font, char_w, digits };
+    let m = Metrics { font, char_w, digits, blame: input.blame.is_some() };
 
     let full = ui.available_rect_before_wrap();
     let main = Rect::from_min_max(full.min, pos2(full.max.x - OVERVIEW_WIDTH, full.max.y));
@@ -79,7 +179,8 @@ pub fn show(
     }
 
     // Horizontal scrolling: trackpad / shift+wheel while hovering the diff.
-    let text_area_w = text_area_width(&m, main.width(), input.unified);
+    let probe = panes(&m, main, input);
+    let text_area_w = probe.last().map_or(main.width(), |(_, p)| p.rect.max.x - p.text_x);
     let max_h = (input.max_line_chars.min(MAX_SHOWN_CHARS) as f32 * char_w - text_area_w + 3.0 * char_w).max(0.0);
     if ui.rect_contains_pointer(main) {
         let dx = ui.input(|i| i.smooth_scroll_delta.x);
@@ -98,39 +199,28 @@ pub fn show(
                 let origin = ui.max_rect().min;
                 let width = ui.max_rect().width();
                 let rows_rect = Rect::from_min_size(origin, vec2(width, content_h));
+                let panes = panes(&m, rows_rect, input);
                 let response = ui.interact(rows_rect, ui.id().with("rows"), Sense::click());
-                if response.clicked()
-                    && let Some(pos) = response.interact_pointer_pos()
-                {
-                    let row = ((pos.y - origin.y) / row_h).floor() as usize;
-                    if row < total {
-                        actions.push(Action::ClickRow(row));
-                    }
-                }
+                handle_pointer(ui, &response, &m, &panes, input, origin, row_h, *h_scroll, actions);
 
                 let first = (viewport.min.y / row_h).floor().max(0.0) as usize;
                 let last = ((viewport.max.y / row_h).ceil() as usize + 1).min(total);
                 let current = input.current_hunk.and_then(|h| input.hunks.get(h)).cloned().unwrap_or(0..0);
                 let painter = ui.painter();
+                let separator = ui.visuals().widgets.noninteractive.bg_stroke.color;
                 for i in first..last {
                     let y = origin.y + i as f32 * row_h;
-                    let row_rect = Rect::from_min_size(pos2(origin.x, y), vec2(width, row_h));
                     let row = &input.rows[i];
-                    if input.unified {
-                        paint_unified_row(painter, &m, &pal, row_rect, row, input, *h_scroll);
-                    } else {
-                        let half = width / 2.0;
-                        let left = Rect::from_min_size(row_rect.min, vec2(half, row_h));
-                        let right = Rect::from_min_size(pos2(origin.x + half, y), vec2(width - half, row_h));
-                        paint_cell(painter, &m, &pal, left, row.left.as_ref(), input.old, input.hl_old, *h_scroll, Side::Old);
-                        paint_cell(painter, &m, &pal, right, row.right.as_ref(), input.new, input.hl_new, *h_scroll, Side::New);
-                        painter.line_segment(
-                            [pos2(right.min.x, y), pos2(right.min.x, y + row_h)],
-                            Stroke::new(1.0, ui.visuals().widgets.noninteractive.bg_stroke.color),
-                        );
+                    for (pane_side, pane) in &panes {
+                        let rect = Rect::from_min_max(pos2(pane.rect.min.x, y), pos2(pane.rect.max.x, y + row_h));
+                        let cell = cell_for(row, *pane_side, input);
+                        paint_cell(painter, &m, &pal, pane, rect, row, cell, input, *h_scroll, i == first);
+                        if *pane_side == Side::New && panes.len() == 2 {
+                            painter.line_segment([pos2(rect.min.x, y), pos2(rect.min.x, y + row_h)], Stroke::new(1.0, separator));
+                        }
                     }
                     if current.contains(&i) {
-                        painter.rect_filled(Rect::from_min_size(row_rect.min, vec2(3.0, row_h)), 0.0, pal.accent);
+                        painter.rect_filled(Rect::from_min_size(pos2(origin.x, y), vec2(3.0, row_h)), 0.0, pal.accent);
                     }
                 }
             })
@@ -142,26 +232,149 @@ pub fn show(
     paint_overview(ui, &pal, bar, input, offset, main.height(), content_h, scroll_to_row);
 }
 
-#[derive(Clone, Copy, PartialEq)]
-enum Side {
-    Old,
-    New,
+/// What is under the pointer.
+enum Hit<'a> {
+    Text { cursor: Cursor },
+    Blame { commit: &'a BlameCommit },
+    Other,
 }
 
-fn text_area_width(m: &Metrics, width: f32, unified: bool) -> f32 {
-    if unified {
-        width - 2.0 * gutter_width(m) - marker_width(m)
-    } else {
-        width / 2.0 - gutter_width(m) - marker_width(m)
+#[allow(clippy::too_many_arguments)]
+fn hit_test<'a>(
+    pos: Pos2,
+    m: &Metrics,
+    panes: &[(Side, Pane)],
+    input: &'a DiffInput<'_>,
+    origin: Pos2,
+    row_h: f32,
+    h_scroll: f32,
+) -> (Option<usize>, Hit<'a>) {
+    let row_idx = ((pos.y - origin.y) / row_h).floor();
+    if row_idx < 0.0 || row_idx as usize >= input.rows.len() {
+        return (None, Hit::Other);
+    }
+    let row_idx = row_idx as usize;
+    let Some((pane_side, pane)) = panes.iter().find(|(_, p)| p.rect.x_range().contains(pos.x)) else {
+        return (Some(row_idx), Hit::Other);
+    };
+    let Some((cell, side)) = cell_for(&input.rows[row_idx], *pane_side, input) else {
+        return (Some(row_idx), Hit::Other);
+    };
+    if m.blame && pos.x < pane.blame_x + m.blame_w() {
+        let blame = input.blame.and_then(|b| if side == Side::Old { b.old } else { b.new });
+        return match blame.and_then(|b| b.commit_for_line(cell.line as usize)) {
+            Some(commit) => (Some(row_idx), Hit::Blame { commit }),
+            None => (Some(row_idx), Hit::Other),
+        };
+    }
+    if pos.x >= pane.text_x {
+        let lines = if side == Side::Old { input.old } else { input.new };
+        let text = lines.get(cell.line as usize).map_or("", String::as_str);
+        let display_col = ((pos.x - pane.text_x + h_scroll) / m.char_w).floor().max(0.0) as usize;
+        let col = byte_at_display_col(text, display_col) as u32;
+        return (Some(row_idx), Hit::Text { cursor: Cursor { side, line: cell.line, col } });
+    }
+    (Some(row_idx), Hit::Other)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn handle_pointer(
+    ui: &Ui,
+    response: &egui::Response,
+    m: &Metrics,
+    panes: &[(Side, Pane)],
+    input: &DiffInput<'_>,
+    origin: Pos2,
+    row_h: f32,
+    h_scroll: f32,
+    actions: &mut Vec<Action>,
+) {
+    let command = ui.input(|i| i.modifiers.command);
+    if let Some(pos) = response.hover_pos() {
+        match hit_test(pos, m, panes, input, origin, row_h, h_scroll).1 {
+            Hit::Blame { commit } => {
+                ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+                response.clone().on_hover_ui_at_pointer(|ui| blame_tooltip(ui, commit));
+            }
+            Hit::Text { .. } if command => ui.ctx().set_cursor_icon(CursorIcon::PointingHand),
+            _ => {}
+        }
+    }
+    if response.clicked()
+        && let Some(pos) = response.interact_pointer_pos()
+    {
+        let (row, hit) = hit_test(pos, m, panes, input, origin, row_h, h_scroll);
+        if let Some(row) = row {
+            actions.push(Action::ClickRow(row));
+        }
+        match hit {
+            Hit::Text { cursor } => {
+                actions.push(Action::SetCursor(cursor));
+                if command {
+                    actions.push(Action::GoToDefinition);
+                }
+            }
+            Hit::Blame { commit } => actions.push(Action::OpenCommit { id: commit.id, path: Some(commit.path.clone()) }),
+            Hit::Other => {}
+        }
     }
 }
 
-fn gutter_width(m: &Metrics) -> f32 {
-    m.digits as f32 * m.char_w + 14.0
+pub fn blame_tooltip(ui: &mut Ui, c: &BlameCommit) {
+    let pal = palette(ui);
+    ui.horizontal(|ui| {
+        ui.monospace(c.id.to_hex_with_len(10).to_string());
+        if c.ai_assisted {
+            ui.colored_label(pal.ai, "AI-assisted");
+        }
+        if c.boundary {
+            ui.weak("(boundary)");
+        }
+    });
+    ui.strong(&c.summary);
+    ui.label(format!("Author: {} <{}>  {}", c.author.name, c.author.email, format_time(&c.author)));
+    let committer = format!("Committer: {} <{}>  {}", c.committer.name, c.committer.email, format_time(&c.committer));
+    if c.committer_differs() {
+        ui.colored_label(pal.warn, format!("* {committer}"));
+    } else {
+        ui.label(committer);
+    }
+    for co in &c.co_authors {
+        ui.label(format!("Co-author: {co}"));
+    }
+    ui.weak("Click to open this commit");
 }
 
-fn marker_width(m: &Metrics) -> f32 {
-    m.char_w + 8.0
+/// Byte offset of the character at a display column (tabs count as four columns).
+pub fn byte_at_display_col(text: &str, col: usize) -> usize {
+    let mut x = 0;
+    for (i, c) in text.char_indices() {
+        let w = if c == '\t' { TAB_WIDTH } else { 1 };
+        if col < x + w {
+            return i;
+        }
+        x += w;
+    }
+    text.len()
+}
+
+/// A stable colour per person.
+pub fn person_colour(identity: &str, dark: bool) -> Color32 {
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    identity.to_ascii_lowercase().hash(&mut h);
+    let hue = (h.finish() % 360) as f32 / 360.0;
+    let (s, v) = if dark { (0.55, 0.85) } else { (0.75, 0.6) };
+    egui::ecolor::Hsva::new(hue, s, v, 1.0).into()
+}
+
+pub fn initials(name: &str) -> String {
+    let words: Vec<&str> = name.split_whitespace().collect();
+    let s: String = match words.as_slice() {
+        [] => "?".into(),
+        [one] => one.chars().take(2).collect(),
+        [first, .., last] => first.chars().take(1).chain(last.chars().take(1)).collect(),
+    };
+    s.to_uppercase()
 }
 
 fn kind_bg(pal: &Palette, kind: LineKind) -> Option<Color32> {
@@ -189,66 +402,83 @@ fn paint_cell(
     painter: &egui::Painter,
     m: &Metrics,
     pal: &Palette,
+    pane: &Pane,
     rect: Rect,
-    cell: Option<&Cell>,
-    lines: &[String],
-    hl: Option<&Highlighted>,
+    row: &Row,
+    cell: Option<(&Cell, Side)>,
+    input: &DiffInput<'_>,
     h_scroll: f32,
-    side: Side,
+    first_visible: bool,
 ) {
-    let Some(cell) = cell else {
+    let Some((cell, side)) = cell else {
         painter.rect_filled(rect, 0.0, pal.filler);
         return;
     };
     if let Some(bg) = kind_bg(pal, cell.kind) {
         painter.rect_filled(rect, 0.0, bg);
     }
-    let gutter = gutter_width(m);
-    painter.text(
-        pos2(rect.min.x + gutter - 8.0, rect.center().y),
-        Align2::RIGHT_CENTER,
-        cell.line + 1,
-        m.font.clone(),
-        pal.weak,
-    );
-    let marker_x = rect.min.x + gutter;
-    painter.text(pos2(marker_x + 2.0, rect.center().y), Align2::LEFT_CENTER, marker(cell.kind, side), m.font.clone(), pal.weak);
-    let text_rect = Rect::from_min_max(pos2(marker_x + marker_width(m), rect.min.y), rect.max);
-    paint_text(painter, m, pal, text_rect, cell, lines, hl, h_scroll);
+    if input.cursor.is_some_and(|c| c.side == side && c.line == cell.line) {
+        painter.rect_filled(rect, 0.0, pal.cursor_line);
+    }
+    let y = rect.center().y;
+
+    if let Some(blame) = input.blame {
+        let b = if side == Side::Old { blame.old } else { blame.new };
+        if let Some(b) = b {
+            paint_blame(painter, m, pal, pane, rect, b, cell.line as usize, blame.by_committer, first_visible);
+        }
+    }
+
+    // Line numbers: unified rows show old and new numbers in separate columns.
+    let numbers: Vec<Option<u32>> = if pane.numbers.len() == 2 {
+        vec![row.left.as_ref().map(|c| c.line), row.right.as_ref().map(|c| c.line)]
+    } else {
+        vec![Some(cell.line)]
+    };
+    for (x, n) in pane.numbers.iter().zip(numbers) {
+        if let Some(n) = n {
+            painter.text(pos2(*x, y), Align2::RIGHT_CENTER, n + 1, m.font.clone(), pal.weak);
+        }
+    }
+    if !input.single {
+        painter.text(pos2(pane.marker_x + 2.0, y), Align2::LEFT_CENTER, marker(cell.kind, side), m.font.clone(), pal.weak);
+    }
+    let (lines, hl) = match side {
+        Side::Old => (input.old, input.hl_old),
+        Side::New => (input.new, input.hl_new),
+    };
+    paint_text(painter, m, pal, pane.text_rect(rect), cell, lines, hl, h_scroll);
 }
 
-fn paint_unified_row(
+#[allow(clippy::too_many_arguments)]
+fn paint_blame(
     painter: &egui::Painter,
     m: &Metrics,
     pal: &Palette,
+    pane: &Pane,
     rect: Rect,
-    row: &Row,
-    input: &DiffInput<'_>,
-    h_scroll: f32,
+    blame: &Blame,
+    line: usize,
+    by_committer: bool,
+    first_visible: bool,
 ) {
-    // Context rows carry both sides; show the new one. Change rows carry exactly one side.
-    let (cell, lines, hl, side) = if let Some(r) = &row.right {
-        (r, input.new, input.hl_new, Side::New)
-    } else if let Some(l) = &row.left {
-        (l, input.old, input.hl_old, Side::Old)
-    } else {
-        return;
-    };
-    if let Some(bg) = kind_bg(pal, cell.kind) {
-        painter.rect_filled(rect, 0.0, bg);
+    let Some(&idx) = blame.lines.get(line) else { return };
+    let c = &blame.commits[idx as usize];
+    let who = if by_committer { &c.committer } else { &c.author };
+    let dark = pal.dark;
+    let colour = person_colour(&who.email, dark);
+    let gutter = Rect::from_min_max(pos2(pane.blame_x, rect.min.y), pos2(pane.blame_x + m.blame_w() - 4.0, rect.max.y));
+    painter.rect_filled(Rect::from_min_size(gutter.min, vec2(3.0, rect.height())), 0.0, colour);
+    let group_start = line == 0 || blame.lines.get(line - 1) != Some(&idx);
+    if group_start || first_visible {
+        let mut label = initials(&who.name);
+        label.push(if c.committer_differs() { '*' } else { ' ' });
+        label.push(if c.ai_assisted { '^' } else { ' ' });
+        painter.text(pos2(gutter.min.x + 6.0, rect.center().y), Align2::LEFT_CENTER, label, m.font.clone(), colour);
     }
-    let gutter = gutter_width(m);
-    let y = rect.center().y;
-    if let Some(l) = &row.left {
-        painter.text(pos2(rect.min.x + gutter - 8.0, y), Align2::RIGHT_CENTER, l.line + 1, m.font.clone(), pal.weak);
+    if group_start && line > 0 {
+        painter.line_segment([pos2(gutter.min.x, rect.min.y), pos2(gutter.max.x, rect.min.y)], Stroke::new(1.0, pal.filler));
     }
-    if let Some(r) = &row.right {
-        painter.text(pos2(rect.min.x + 2.0 * gutter - 8.0, y), Align2::RIGHT_CENTER, r.line + 1, m.font.clone(), pal.weak);
-    }
-    let marker_x = rect.min.x + 2.0 * gutter;
-    painter.text(pos2(marker_x + 2.0, y), Align2::LEFT_CENTER, marker(cell.kind, side), m.font.clone(), pal.weak);
-    let text_rect = Rect::from_min_max(pos2(marker_x + marker_width(m), rect.min.y), rect.max);
-    paint_text(painter, m, pal, text_rect, cell, lines, hl, h_scroll);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -393,5 +623,21 @@ mod tests {
         let backgrounds: Vec<_> = job.sections.iter().map(|s| s.format.background).collect();
         assert!(backgrounds.contains(&Color32::RED));
         assert_eq!(job.sections[0].format.color, Color32::from_rgb(1, 2, 3));
+    }
+
+    #[test]
+    fn display_columns_map_to_bytes() {
+        assert_eq!(byte_at_display_col("\tfoo", 0), 0);
+        assert_eq!(byte_at_display_col("\tfoo", 3), 0);
+        assert_eq!(byte_at_display_col("\tfoo", 4), 1);
+        assert_eq!(byte_at_display_col("é$x", 1), 2);
+        assert_eq!(byte_at_display_col("ab", 9), 2);
+    }
+
+    #[test]
+    fn initials_from_names() {
+        assert_eq!(initials("Alice Admin"), "AA");
+        assert_eq!(initials("Mary Ann Smith"), "MS");
+        assert_eq!(initials("bob"), "BO");
     }
 }

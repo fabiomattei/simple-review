@@ -5,14 +5,31 @@ pub mod diff;
 pub mod files;
 pub mod header;
 pub mod help;
+pub mod peek;
 
 use std::path::PathBuf;
 
 use egui::Color32;
+use review_core::ObjectId;
 use review_core::git::ChangeStatus;
+
+use crate::state::{Cursor, PeekTab};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Action {
+    SetCursor(Cursor),
+    GoToDefinition,
+    FindReferences,
+    OpenCommit { id: ObjectId, path: Option<String> },
+    ToggleBlame,
+    ToggleBlameMode,
+    ToggleAllFiles,
+    OpenTreeFile(String),
+    PeekTab(PeekTab),
+    PeekSelect(usize),
+    OpenDefinition,
+    OpenReference(usize),
+    ClosePeek,
     OpenDialog,
     OpenRepo(PathBuf),
     Reload,
@@ -53,6 +70,8 @@ pub struct Palette {
     pub accent: Color32,
     pub ai: Color32,
     pub warn: Color32,
+    pub cursor_line: Color32,
+    pub dark: bool,
 }
 
 impl Palette {
@@ -70,6 +89,8 @@ impl Palette {
                 accent: Color32::from_rgb(0x4d, 0x9d, 0xff),
                 ai: Color32::from_rgb(0xb3, 0x88, 0xff),
                 warn: Color32::from_rgb(0xe5, 0xa5, 0x3c),
+                cursor_line: Color32::from_rgba_unmultiplied(0x4d, 0x9d, 0xff, 28),
+                dark,
             }
         } else {
             Palette {
@@ -84,6 +105,8 @@ impl Palette {
                 accent: Color32::from_rgb(0x09, 0x69, 0xda),
                 ai: Color32::from_rgb(0x82, 0x50, 0xdf),
                 warn: Color32::from_rgb(0x9a, 0x67, 0x00),
+                cursor_line: Color32::from_rgba_unmultiplied(0x09, 0x69, 0xda, 22),
+                dark,
             }
         }
     }

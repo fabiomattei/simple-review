@@ -236,6 +236,14 @@ impl<K: Eq + Hash + Clone, V: Clone> LruCache<K, V> {
         }
     }
 
+    pub fn len(&self) -> usize {
+        self.map.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.map.is_empty()
+    }
+
     fn touch(&mut self, key: &K) {
         if let Some(pos) = self.order.iter().position(|k| k == key) {
             let k = self.order.remove(pos).expect("position is valid");

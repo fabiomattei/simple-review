@@ -7,6 +7,8 @@ pub struct Location {
     pub commit: ObjectId,
     pub parent_idx: usize,
     pub path: Option<String>,
+    /// Set when `path` was opened as a whole file at this commit rather than as a diff.
+    pub browse: Option<ObjectId>,
 }
 
 #[derive(Default)]
@@ -29,6 +31,7 @@ impl History {
             && cur.commit == loc.commit
             && cur.parent_idx == loc.parent_idx
             && cur.path.is_none()
+            && loc.browse.is_none()
         {
             *cur = loc;
             self.entries.truncate(self.pos + 1);
@@ -74,7 +77,7 @@ mod tests {
     use super::*;
 
     fn loc(n: u8, path: Option<&str>) -> Location {
-        Location { commit: ObjectId::from_bytes_or_panic(&[n; 20]), parent_idx: 0, path: path.map(String::from) }
+        Location { commit: ObjectId::from_bytes_or_panic(&[n; 20]), parent_idx: 0, path: path.map(String::from), browse: None }
     }
 
     #[test]

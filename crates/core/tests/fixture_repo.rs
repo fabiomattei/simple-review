@@ -54,6 +54,9 @@ fn commit_metadata() {
     assert_eq!(rebased.author.name, "Carol Coder");
     assert_eq!(rebased.committer.name, "Alice Admin");
 
+    let old_laptop = commit(&repo, &fx, "old_laptop");
+    assert_eq!((old_laptop.author.name.as_str(), old_laptop.author.email.as_str()), ("Bob Backend", "bob@example.com"));
+
     let merge = commit(&repo, &fx, "merge");
     assert!(merge.is_merge());
     assert_eq!(merge.parents[1].to_string(), fx.commit("feature_tz"));
@@ -154,4 +157,126 @@ fn line_ending_change_is_reported_not_diffed() {
     };
     assert!(diff.hunks.is_empty());
     assert!(diff.line_endings_changed());
+}
+
+mod phase2 {
+    use super::*;
+    use review_core::blame::{self, blame_file};
+    use review_core::symbols::{ParseCache, SymbolIndex, SymbolKind};
+
+    fn index(repo: &Repo, commit: review_core::ObjectId) -> SymbolIndex {
+        SymbolIndex::build(repo, commit, &|_| true, &ParseCache::default(), &|_| {}, &|| false).unwrap().unwrap()
+    }
+
+    fn line_col(text: &str, needle: &str) -> (u32, u32) {
+        let (i, line) = text.lines().enumerate().find(|(_, l)| l.contains(needle)).unwrap();
+        (i as u32, line.find(needle).unwrap() as u32 + 1)
+    }
+
+    fn file_text(repo: &Repo, commit: review_core::ObjectId, path: &str) -> String {
+        let f = repo.find_file(commit, path).unwrap().unwrap();
+        String::from_utf8(repo.read_blob(f.id).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn lists_full_tree() {
+        let (_dir, fx, repo) = setup();
+        let files = repo.list_files(parse_id(fx.commit("move")).unwrap()).unwrap();
+        let paths: Vec<_> = files.iter().map(|f| f.path.as_str()).collect();
+        assert!(paths.contains(&"app/Services/InvoiceService.php"));
+        assert!(paths.contains(&"app/Helpers/legacy.php"));
+        assert!(paths.windows(2).all(|w| w[0] < w[1]));
+    }
+
+    #[test]
+    fn definition_resolves_in_the_version_clicked() {
+        let (_dir, fx, repo) = setup();
+        let c = commit(&repo, &fx, "move");
+        let (old, new) = (index(&repo, c.parents[0]), index(&repo, c.id));
+        let path = "app/Services/InvoiceService.php";
+        let old_text = file_text(&repo, c.parents[0], path);
+        let new_text = file_text(&repo, c.id, path);
+
+        let (l, col) = line_col(&old_text, "round($sum)");
+        let left = old.definition_at(path, l, col).unwrap();
+        let (l, col) = line_col(&new_text, "round($sum)");
+        let right = new.definition_at(path, l, col).unwrap();
+        assert_eq!(left.candidates.len(), 1);
+        assert_eq!(right.candidates.len(), 1);
+        let (ls, rs) = (&left.candidates[0].symbol, &right.candidates[0].symbol);
+        assert_eq!(ls.fqn, "App\\Services\\InvoiceService::round");
+        assert_eq!(rs.fqn, ls.fqn);
+        assert!(old_text.lines().nth(ls.span.line as usize).unwrap().contains("function round"));
+        assert!(new_text.lines().nth(rs.span.line as usize).unwrap().contains("function round"));
+        assert!(rs.span.line > ls.span.line, "round() moved down in the commit");
+
+        // A method that only exists after the commit.
+        let ai = commit(&repo, &fx, "ai");
+        let ai_text = file_text(&repo, ai.id, path);
+        let (l, col) = line_col(&ai_text, "discount($sum)");
+        assert_eq!(index(&repo, ai.id).definition_at(path, l, col).unwrap().candidates.len(), 1);
+        assert!(index(&repo, ai.parents[0]).file(path).unwrap().symbols.iter().all(|s| s.name != "discount"));
+    }
+
+    #[test]
+    fn finds_cross_file_references() {
+        let (_dir, fx, repo) = setup();
+        let idx = index(&repo, parse_id(fx.commit("ai")).unwrap());
+        let path = "app/Services/InvoiceService.php";
+        let text = file_text(&repo, idx.commit, path);
+        let (l, col) = line_col(&text, "class InvoiceService");
+        let class = idx.definition_at(path, l, col + 6).unwrap().candidates.remove(0);
+        assert_eq!(class.symbol.kind, SymbolKind::Class);
+        let hits = idx.references(&class);
+        let paths: Vec<_> = hits.iter().map(|h| h.path.as_str()).collect();
+        assert_eq!(paths, vec!["app/Http/Controllers/AccountController.php"; 2], "use + type hint");
+
+        let (l, col) = line_col(&text, "function forUser");
+        let for_user = idx.definition_at(path, l, col + 9).unwrap().candidates.remove(0);
+        let hits = idx.references(&for_user);
+        assert_eq!(hits.len(), 1);
+        assert!(hits[0].reference.context.contains("$service->forUser($user)"));
+    }
+
+    #[test]
+    fn blame_honours_ignore_revs_moves_and_identities() {
+        let (_dir, fx, repo) = setup();
+        let head = repo.head_id().unwrap().unwrap();
+        let ignore = blame::ignore_revs(&repo, head);
+        assert_eq!(ignore, vec![parse_id(fx.commit("pint")).unwrap()]);
+        let path = "app/Services/InvoiceService.php";
+        let pint = parse_id(fx.commit("pint")).unwrap();
+        let text = file_text(&repo, pint, path);
+        let (sum_line, _) = line_col(&text, "$sum    =  0;");
+
+        let with = blame_file(&repo, pint, path, &ignore).unwrap();
+        assert_eq!(with.lines.len(), text.lines().count());
+        assert_ne!(with.commit_for_line(sum_line as usize).unwrap().id, pint, "formatting commit is ignored");
+        let without = blame_file(&repo, pint, path, &[]).unwrap();
+        assert_eq!(without.commit_for_line(sum_line as usize).unwrap().id, pint);
+
+        // round() moved in `move`, but keeps the commit that wrote it.
+        let moved = parse_id(fx.commit("move")).unwrap();
+        let text = file_text(&repo, moved, path);
+        let (round_line, _) = line_col(&text, "$rounded = round(");
+        let b = blame_file(&repo, moved, path, &[]).unwrap();
+        assert_eq!(b.commit_for_line(round_line as usize).unwrap().id.to_string(), fx.commit("invoice"));
+
+        // Author vs committer, AI flag.
+        let ai = parse_id(fx.commit("ai")).unwrap();
+        let text = file_text(&repo, ai, path);
+        let b = blame_file(&repo, ai, path, &ignore).unwrap();
+        let (l, _) = line_col(&text, "discount(float");
+        assert!(b.commit_for_line(l as usize).unwrap().ai_assisted);
+        let routes = blame_file(&repo, parse_id(fx.commit("rebased")).unwrap(), "routes/web.php", &[]).unwrap();
+        let rebased = routes.commits.iter().find(|c| c.id == parse_id(fx.commit("rebased")).unwrap()).unwrap();
+        assert_eq!(rebased.author.name, "Carol Coder");
+        assert_eq!(rebased.committer.name, "Alice Admin");
+        assert!(rebased.committer_differs());
+
+        // .mailmap folds bob@old-laptop.local into Bob Backend.
+        let b = blame_file(&repo, parse_id(fx.commit("old_laptop")).unwrap(), "composer.json", &[]).unwrap();
+        let c = b.commits.iter().find(|c| c.id == parse_id(fx.commit("old_laptop")).unwrap()).unwrap();
+        assert_eq!((c.author.name.as_str(), c.author.email.as_str()), ("Bob Backend", "bob@example.com"));
+    }
 }

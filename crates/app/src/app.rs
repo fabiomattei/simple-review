@@ -1,24 +1,27 @@
 //! The application: owns state, runs background jobs and applies user actions.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use egui::{Key, Modifiers, RichText, Ui};
 use review_core::ObjectId;
+use review_core::blame::{self, Blame};
 use review_core::diff::DiffOptions;
 use review_core::diff::content::is_generated;
 use review_core::file_view::{self, FileView, Placeholder};
 use review_core::git::{CommitInfo, Repo};
 use review_core::highlight::{Highlighted, Highlighter, ThemeKind};
 use review_core::settings::{GLOBAL, Store};
-use review_core::tasks::{CommitPager, LruCache, Notify, PagerEvent, TaskPool};
+use review_core::symbols::{ParseCache, SymbolIndex};
+use review_core::tasks::{CancelToken, CommitPager, LruCache, Notify, PagerEvent, TaskPool};
 
 use crate::nav::{History, Location};
 use crate::state::{
-    FilesState, HighlightKey, HunkTarget, JobResult, RepoState, SelectedCommit, SelectedFile, ViewKey, ViewState,
+    BlameKey, FilesState, HighlightKey, HunkTarget, JobResult, Peek, RepoState, SelectedCommit, SelectedFile, Side,
+    ViewKey, ViewState,
 };
-use crate::ui::diff::{DiffInput, KeyScroll};
+use crate::ui::diff::{BlameInput, DiffInput, KeyScroll};
 use crate::ui::{self, Action, human_size};
 
 const FIRST_PAGE: usize = 300;
@@ -42,6 +45,17 @@ pub struct ReviewApp {
     hl_pending: HashSet<HighlightKey>,
     key_scroll: Option<KeyScroll>,
     h_delta: f32,
+    parse_cache: ParseCache,
+    indexes: LruCache<ObjectId, Arc<SymbolIndex>>,
+    index_jobs: HashMap<ObjectId, CancelToken>,
+    blames: LruCache<BlameKey, Arc<Result<Blame, String>>>,
+    blame_pending: HashSet<BlameKey>,
+    ignore_revs: Arc<Vec<ObjectId>>,
+    blame_on: bool,
+    blame_by_committer: bool,
+    show_all_files: bool,
+    file_filter: String,
+    peek: Peek,
 }
 
 impl ReviewApp {
@@ -61,6 +75,8 @@ impl ReviewApp {
         let pref = |key: &str, default: bool| store.as_ref().map_or(default, |s| s.get_bool(GLOBAL, key, default));
         let opts = DiffOptions { ignore_whitespace: pref("ignore_whitespace", false), intra_line: pref("intra_line", true) };
         let unified = pref("unified", false);
+        let blame_on = pref("blame", false);
+        let blame_by_committer = pref("blame_by_committer", false);
         let recent = store.as_ref().and_then(|s| s.recent_repos(12).ok()).unwrap_or_default();
 
         // Load syntax definitions off the UI thread so the first diff doesn't pay for it.
@@ -83,6 +99,17 @@ impl ReviewApp {
             hl_pending: HashSet::new(),
             key_scroll: None,
             h_delta: 0.0,
+            parse_cache: ParseCache::default(),
+            indexes: LruCache::new(8),
+            index_jobs: HashMap::new(),
+            blames: LruCache::new(64),
+            blame_pending: HashSet::new(),
+            ignore_revs: Arc::default(),
+            blame_on,
+            blame_by_committer,
+            show_all_files: false,
+            file_filter: String::new(),
+            peek: Peek::default(),
         };
         if let Some(path) = initial {
             app.open_repo(&path);
@@ -128,6 +155,15 @@ impl ReviewApp {
             p.request(FIRST_PAGE);
             p
         });
+        self.ignore_revs = Arc::new(head.map(|h| blame::ignore_revs(&repo, h)).unwrap_or_default());
+        self.indexes = LruCache::new(8);
+        for token in self.index_jobs.values() {
+            token.cancel();
+        }
+        self.index_jobs.clear();
+        self.blames = LruCache::new(64);
+        self.blame_pending.clear();
+        self.peek = Peek::default();
         let name = root.file_name().map_or_else(|| root.display().to_string(), |n| n.to_string_lossy().into_owned());
         self.ctx.send_viewport_cmd(egui::ViewportCommand::Title(format!("{name} — Simple Review")));
         self.rs = Some(RepoState {
@@ -155,7 +191,7 @@ impl ReviewApp {
             .and_then(|s| s.reviewed_files(rs.repo.root(), &info.id.to_string()).ok())
             .unwrap_or_default();
         if push {
-            rs.history.push(Location { commit: info.id, parent_idx, path: None });
+            rs.history.push(Location { commit: info.id, parent_idx, path: None, browse: None });
         }
         let sc = SelectedCommit {
             info,
@@ -166,6 +202,8 @@ impl ReviewApp {
             pending_path: path,
             pending_target: HunkTarget::First,
             reveal_file: true,
+            tree: None,
+            pending_browse: None,
         };
         let (commit, parent) = (sc.info.id, sc.parent());
         let repo = rs.repo.clone();
@@ -176,6 +214,10 @@ impl ReviewApp {
             }
         });
         rs.commit = Some(sc);
+        if self.show_all_files {
+            self.request_tree();
+        }
+        self.prefetch_indexes();
     }
 
     fn select_commit_by_id(&mut self, id: ObjectId, parent_idx: usize, path: Option<String>, push: bool) {
@@ -211,7 +253,7 @@ impl ReviewApp {
             request_view(&self.pool, &rs.repo, &mut sf, self.opts, &mut self.view_cache);
         }
         if push {
-            rs.history.push(Location { commit: sc.info.id, parent_idx: sc.parent_idx, path: Some(path) });
+            rs.history.push(Location { commit: sc.info.id, parent_idx: sc.parent_idx, path: Some(path), browse: None });
         }
         sc.reveal_file = true;
         sc.file = Some(sf);
@@ -231,7 +273,19 @@ impl ReviewApp {
         let Some(rs) = self.rs.as_mut() else { return };
         let same_commit = rs.commit.as_ref().is_some_and(|c| c.info.id == loc.commit && c.parent_idx == loc.parent_idx);
         if !same_commit {
-            self.select_commit_by_id(loc.commit, loc.parent_idx, loc.path, false);
+            match (loc.browse, loc.path) {
+                (Some(browse), Some(path)) => {
+                    self.select_commit_by_id(loc.commit, loc.parent_idx, None, false);
+                    if let Some(sc) = self.rs.as_mut().and_then(|rs| rs.commit.as_mut()) {
+                        sc.pending_browse = Some((browse, path));
+                    }
+                }
+                (_, path) => self.select_commit_by_id(loc.commit, loc.parent_idx, path, false),
+            }
+            return;
+        }
+        if let (Some(browse), Some(path)) = (loc.browse, &loc.path) {
+            self.open_browse(browse, path, false);
             return;
         }
         let sc = rs.commit.as_mut().expect("checked above");
@@ -293,7 +347,9 @@ impl ReviewApp {
                         match result {
                             Ok(view) => {
                                 sf.set_view(view);
-                                sf.reveal_current_hunk(self.unified);
+                                if !sf.apply_pending_line(self.unified) {
+                                    sf.reveal_current_hunk(self.unified);
+                                }
                             }
                             Err(e) => sf.view = ViewState::Error(e),
                         }
@@ -305,9 +361,22 @@ impl ReviewApp {
                         self.hl_cache.insert(key, h);
                     }
                 }
+                JobResult::Index { commit, result } => self.on_index(commit, result),
+                JobResult::Blame { key, result } => {
+                    self.blame_pending.remove(&key);
+                    self.blames.insert(key, result);
+                }
+                JobResult::Tree { commit, result } => {
+                    if let Some(sc) = self.rs.as_mut().and_then(|rs| rs.commit.as_mut())
+                        && sc.info.id == commit
+                    {
+                        sc.tree = Some(result);
+                    }
+                }
             }
         }
         self.ensure_highlighting();
+        self.ensure_blame();
     }
 
     fn on_files(&mut self, commit: ObjectId, parent: Option<ObjectId>, result: Result<Vec<review_core::git::FileChange>, String>) {
@@ -318,10 +387,15 @@ impl ReviewApp {
         match result {
             Ok(files) => {
                 let pending = sc.pending_path.take();
+                let browse = sc.pending_browse.take();
                 let target = sc.pending_target;
                 let index = pending.as_ref().and_then(|p| files.iter().position(|f| f.path() == p));
                 let empty = files.is_empty();
                 sc.files = FilesState::Ready(files);
+                if let Some((commit, path)) = browse {
+                    self.open_browse(commit, &path, false);
+                    return;
+                }
                 match index {
                     Some(i) => self.select_file(i, target, false),
                     None if !empty => self.select_file(0, target, pending.is_none()),
@@ -412,8 +486,9 @@ impl ReviewApp {
             Action::ToggleReviewed => {
                 let Some(sc) = self.rs.as_ref().and_then(|rs| rs.commit.as_ref()) else { return };
                 let Some(sf) = &sc.file else { return };
+                let Some(index) = sf.index else { return };
                 let now = sc.reviewed.contains(sf.change.path());
-                self.set_reviewed(sf.index, !now);
+                self.set_reviewed(index, !now);
             }
             Action::SetParent(i) => self.set_parent(Some(i)),
             Action::CycleParent => self.set_parent(None),
@@ -478,6 +553,48 @@ impl ReviewApp {
                 }
             }
             Action::ToggleHelp => self.show_help = !self.show_help,
+            Action::SetCursor(cursor) => {
+                if let Some(sf) = self.current_file_mut() {
+                    sf.cursor = Some(cursor);
+                }
+            }
+            Action::GoToDefinition => self.go_to_definition(),
+            Action::FindReferences => self.find_references(),
+            Action::OpenCommit { id, path } => self.select_commit_by_id(id, 0, path, true),
+            Action::ToggleBlame => {
+                self.blame_on = !self.blame_on;
+                self.save_pref("blame", self.blame_on);
+            }
+            Action::ToggleBlameMode => {
+                self.blame_by_committer = !self.blame_by_committer;
+                self.save_pref("blame_by_committer", self.blame_by_committer);
+                if !self.blame_on {
+                    self.blame_on = true;
+                    self.save_pref("blame", true);
+                }
+            }
+            Action::ToggleAllFiles => {
+                self.show_all_files = !self.show_all_files;
+                if self.show_all_files {
+                    self.request_tree();
+                }
+            }
+            Action::OpenTreeFile(path) => self.open_tree_file(&path),
+            Action::PeekTab(tab) => {
+                self.peek.open = true;
+                self.peek.tab = tab;
+            }
+            Action::PeekSelect(i) => {
+                if let Some(def) = self.peek.definition.as_mut()
+                    && let crate::state::DefinitionState::Ready { selected, .. } = &mut def.state
+                {
+                    *selected = i;
+                }
+                self.load_snippet();
+            }
+            Action::OpenDefinition => self.open_definition(),
+            Action::OpenReference(i) => self.open_reference(i),
+            Action::ClosePeek => self.peek.open = false,
             Action::LoadMoreCommits => {
                 if let Some(rs) = self.rs.as_mut() {
                     request_more(rs);
@@ -493,7 +610,7 @@ impl ReviewApp {
     fn step_file(&mut self, forward: bool, target: HunkTarget) -> bool {
         let Some(sc) = self.rs.as_ref().and_then(|rs| rs.commit.as_ref()) else { return false };
         let count = sc.files().len();
-        let next = match (sc.file.as_ref().map(|f| f.index), forward) {
+        let next = match (sc.file.as_ref().and_then(|f| f.index), forward) {
             (None, _) if count > 0 => 0,
             (Some(i), true) if i + 1 < count => i + 1,
             (Some(i), false) if i > 0 => i - 1,
@@ -585,6 +702,15 @@ impl ReviewApp {
             if i.consume_key(Modifiers::ALT, Key::ArrowUp) {
                 a.push(Action::PrevFile);
             }
+            if i.consume_key(Modifiers::SHIFT, Key::F12) {
+                a.push(Action::FindReferences);
+            }
+            if i.consume_key(Modifiers::NONE, Key::F12) {
+                a.push(Action::GoToDefinition);
+            }
+            if i.consume_key(Modifiers::SHIFT, Key::B) {
+                a.push(Action::ToggleBlameMode);
+            }
             if i.consume_key(Modifiers::SHIFT, Key::F7) || i.consume_key(Modifiers::SHIFT, Key::N) {
                 a.push(Action::PrevChange);
             }
@@ -604,6 +730,9 @@ impl ReviewApp {
                 (Key::M, Action::CycleParent),
                 (Key::A, Action::ToggleAiOnly),
                 (Key::Enter, Action::ExpandFile),
+                (Key::B, Action::ToggleBlame),
+                (Key::T, Action::ToggleAllFiles),
+                (Key::O, Action::OpenDefinition),
                 (Key::F5, Action::Reload),
                 (Key::F1, Action::ToggleHelp),
                 (Key::Questionmark, Action::ToggleHelp),
@@ -613,8 +742,12 @@ impl ReviewApp {
                     a.push(action);
                 }
             }
-            if i.consume_key(none, Key::Escape) && self.show_help {
-                a.push(Action::ToggleHelp);
+            if i.consume_key(none, Key::Escape) {
+                if self.show_help {
+                    a.push(Action::ToggleHelp);
+                } else if self.peek.open {
+                    a.push(Action::ClosePeek);
+                }
             }
             for (key, s) in [
                 (Key::ArrowDown, KeyScroll::Lines(1.0)),
@@ -707,6 +840,11 @@ impl ReviewApp {
         let unified = self.unified;
         let key_scroll = self.key_scroll.take();
         let h_delta = std::mem::take(&mut self.h_delta);
+        let (old_key, new_key) = self.blame_keys();
+        let blame_old = self.blame_for(&old_key);
+        let blame_new = self.blame_for(&new_key);
+        let blame_on = self.blame_on;
+        let by_committer = self.blame_by_committer;
         let Some(rs) = self.rs.as_mut() else {
             self.welcome(ui, actions);
             return;
@@ -741,6 +879,30 @@ impl ReviewApp {
         ui::header::file_header(ui, sf, reviewed, unified, actions);
         ui.separator();
 
+        let side_blame = |side: Side| -> Option<&Blame> {
+            let b = if side == Side::Old { &blame_old } else { &blame_new };
+            b.as_deref().and_then(|r| r.as_ref().ok())
+        };
+        if self.peek.open {
+            let cursor = sf.cursor;
+            let cursor_blame = cursor.and_then(|c| side_blame(c.side).map(|b| (c, b)));
+            let shown = side_blame(cursor.map_or(Side::New, |c| c.side)).or_else(|| side_blame(Side::New));
+            let error = [&blame_old, &blame_new].into_iter().flatten().find_map(|r| r.as_ref().as_ref().err().map(String::as_str));
+            let info = ui::peek::BlameInfo {
+                enabled: blame_on,
+                loading: blame_on && (blame_new.is_none() && new_key.is_some() || blame_old.is_none() && old_key.is_some()),
+                line: cursor.map(|c| (c.line + 1, cursor_blame.and_then(|(_, b)| b.commit_for_line(c.line as usize)))),
+                by_author: shown.map(|b| b.share(false)).unwrap_or_default(),
+                by_committer: shown.map(|b| b.share(true)).unwrap_or_default(),
+                error,
+            };
+            egui::Panel::bottom("peek")
+                .resizable(true)
+                .default_size(260.0)
+                .min_size(120.0)
+                .show(ui, |ui| ui::peek::show(ui, &self.peek, &info, actions));
+        }
+
         let message = |ui: &mut Ui, text: String, button: Option<&str>, actions: &mut Vec<Action>| {
             ui.vertical_centered(|ui| {
                 ui.add_space(ui.available_height() / 3.0);
@@ -773,7 +935,7 @@ impl ReviewApp {
                         message(ui, "Empty file.".into(), None, actions);
                         return;
                     }
-                    if layout.hunks.is_empty() {
+                    if layout.hunks.is_empty() && !sf.single_pane() {
                         let why = if self.opts.ignore_whitespace { " (whitespace only)" } else { "" };
                         ui.weak(format!("No content changes{why}."));
                     }
@@ -793,9 +955,12 @@ impl ReviewApp {
                         new: &diff.new.lines,
                         hl_old: hl_old.as_deref(),
                         hl_new: hl_new.as_deref(),
-                        unified,
+                        unified: unified || sf.single_pane(),
+                        single: sf.single_pane(),
                         current_hunk: sf.current_hunk,
                         max_line_chars: sf.max_line_chars,
+                        blame: blame_on.then(|| BlameInput { old: side_blame(Side::Old), new: side_blame(Side::New), by_committer }),
+                        cursor: sf.cursor,
                     };
                     sf.h_scroll += h_delta;
                     ui::diff::show(ui, &input, &mut sf.scroll_to_row, &mut sf.h_scroll, key_scroll, actions);
@@ -886,6 +1051,8 @@ impl eframe::App for ReviewApp {
             can_forward: self.rs.as_ref().is_some_and(|rs| rs.history.can_forward()),
             opts: self.opts,
             unified: self.unified,
+            blame_on: self.blame_on,
+            blame_by_committer: self.blame_by_committer,
         };
         egui::Panel::top("toolbar").show(ui, |ui| {
             ui.add_space(3.0);
@@ -894,6 +1061,7 @@ impl eframe::App for ReviewApp {
         });
         egui::Panel::bottom("status").show(ui, |ui| self.status_bar(ui));
 
+        let show_all = self.show_all_files;
         if let Some(rs) = self.rs.as_mut() {
             egui::Panel::left("sidebar").default_size(400.0).min_size(260.0).show(ui, |ui| {
                 if let Some(sc) = rs.commit.as_mut() {
@@ -902,7 +1070,7 @@ impl eframe::App for ReviewApp {
                         .resizable(true)
                         .default_size(ui.available_height() * 0.45)
                         .min_size(120.0)
-                        .show(ui, |ui| ui::files::show(ui, sc, settings, &mut actions));
+                        .show(ui, |ui| ui::files::show(ui, sc, settings, show_all, &mut self.file_filter, &mut actions));
                 }
                 ui::commits::show(ui, rs, &mut actions);
             });
@@ -915,6 +1083,9 @@ impl eframe::App for ReviewApp {
         }
     }
 }
+
+#[path = "code_nav.rs"]
+mod code_nav;
 
 #[cfg(test)]
 #[path = "smoke_test.rs"]

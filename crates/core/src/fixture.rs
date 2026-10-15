@@ -36,6 +36,8 @@ struct Person {
 const ALICE: Person = Person { name: "Alice Admin", email: "alice@example.com" };
 const BOB: Person = Person { name: "Bob Backend", email: "bob@example.com" };
 const CAROL: Person = Person { name: "Carol Coder", email: "carol@example.com" };
+/// Bob before `.mailmap` merged his identities.
+const BOB_OLD: Person = Person { name: "bob", email: "bob@old-laptop.local" };
 const PINT: Person = Person { name: "Pint Bot", email: "pint@example.com" };
 
 impl Builder {
@@ -97,6 +99,33 @@ class UserController extends Controller
     public function show(User $user)
     {
         return $user;
+    }
+}
+"#;
+
+/// The controller after it starts using the invoice service.
+const USER_CONTROLLER_INVOICES: &str = r#"<?php
+
+namespace App\Http\Controllers;
+
+use App\Models\User;
+use App\Services\InvoiceService;
+
+class UserController extends Controller
+{
+    public function index()
+    {
+        return User::all();
+    }
+
+    public function show(User $user)
+    {
+        return $user;
+    }
+
+    public function invoices(User $user, InvoiceService $service)
+    {
+        return $service->forUser($user);
     }
 }
 "#;
@@ -175,7 +204,7 @@ const ROUTES: &str = "<?php\n\nuse Illuminate\\Support\\Facades\\Route;\n\nRoute
 /// Commits on `main`, oldest first:
 /// `initial`, `invoice` (adds a binary), `rename` (rename + edit), `move` (moved block),
 /// `pint` (whitespace-only reformat), `ignore_revs` (adds `.git-blame-ignore-revs`),
-/// `delete` (removes a file), `rebased` (author ≠ committer), `ai` (Co-Authored-By: Claude),
+/// `delete` (removes a file), `old_laptop` (identity merged by `.mailmap`), `rebased` (author ≠ committer), `ai` (Co-Authored-By: Claude),
 /// `main_tz`, then `feature_tz` on a branch, `merge` (conflict resolved by hand), `crlf`.
 pub fn build(dir: &Path) -> Result<Fixture> {
     std::fs::create_dir_all(dir)?;
@@ -196,6 +225,7 @@ pub fn build(dir: &Path) -> Result<Fixture> {
     commits.insert("initial", b.commit("Initial Laravel skeleton", ALICE, ALICE)?);
 
     b.write("app/Services/InvoiceService.php", INVOICE_SERVICE)?;
+    b.write("app/Http/Controllers/UserController.php", USER_CONTROLLER_INVOICES)?;
     b.write("public/logo.png", [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 0x0d, b'I', b'H', b'D', b'R'])?;
     b.write("storage/app/data.bin", [0u8, 1, 2, 3, 255, 254])?;
     commits.insert("invoice", b.commit("Add invoice service and logo", BOB, BOB)?);
@@ -203,7 +233,7 @@ pub fn build(dir: &Path) -> Result<Fixture> {
     b.git(&["mv", "app/Http/Controllers/UserController.php", "app/Http/Controllers/AccountController.php"], ALICE, ALICE)?;
     b.write(
         "app/Http/Controllers/AccountController.php",
-        USER_CONTROLLER.replace("class UserController", "class AccountController"),
+        USER_CONTROLLER_INVOICES.replace("class UserController", "class AccountController"),
     )?;
     commits.insert("rename", b.commit("Rename UserController to AccountController", ALICE, ALICE)?);
 
@@ -219,6 +249,9 @@ pub fn build(dir: &Path) -> Result<Fixture> {
 
     std::fs::remove_file(dir.join("app/Helpers/legacy.php"))?;
     commits.insert("delete", b.commit("Remove legacy helper", BOB, BOB)?);
+
+    b.write("composer.json", "{\n    \"name\": \"acme/shop\",\n    \"require\": {\n        \"php\": \"^8.2\",\n        \"laravel/framework\": \"^11.0\"\n    }\n}\n")?;
+    commits.insert("old_laptop", b.commit("Require PHP 8.2", BOB_OLD, BOB_OLD)?);
 
     b.write("routes/web.php", ROUTES.replace("UserController", "AccountController"))?;
     commits.insert("rebased", b.commit("Point routes at AccountController", CAROL, ALICE)?);

@@ -17,6 +17,8 @@ pub struct ToolbarState<'a> {
     pub can_forward: bool,
     pub opts: DiffOptions,
     pub unified: bool,
+    pub blame_on: bool,
+    pub blame_by_committer: bool,
 }
 
 pub fn toolbar(ui: &mut Ui, s: &ToolbarState<'_>, actions: &mut Vec<Action>) {
@@ -64,6 +66,17 @@ pub fn toolbar(ui: &mut Ui, s: &ToolbarState<'_>, actions: &mut Vec<Action>) {
         let mut il = s.opts.intra_line;
         if ui.toggle_value(&mut il, "Word diff").on_hover_text("Intra-line highlighting (i)").changed() {
             actions.push(Action::ToggleIntraLine);
+        }
+        ui.separator();
+        let mut blame = s.blame_on;
+        if ui.toggle_value(&mut blame, "Blame").on_hover_text("Blame gutter (b)").changed() {
+            actions.push(Action::ToggleBlame);
+        }
+        if s.blame_on {
+            let mode = if s.blame_by_committer { "by committer" } else { "by author" };
+            if ui.small_button(mode).on_hover_text("Switch author / committer (Shift+B)").clicked() {
+                actions.push(Action::ToggleBlameMode);
+            }
         }
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             if ui.button("?").on_hover_text("Keyboard shortcuts (?)").clicked() {
@@ -124,9 +137,16 @@ pub fn file_header(ui: &mut Ui, sf: &SelectedFile, reviewed: bool, unified: bool
     let pal = palette(ui);
     let change = &sf.change;
     ui.horizontal_wrapped(|ui| {
-        let mut r = reviewed;
-        if ui.checkbox(&mut r, "Reviewed").on_hover_text("r").changed() {
-            actions.push(Action::SetReviewed(sf.index, r));
+        if let Some(index) = sf.index {
+            let mut r = reviewed;
+            if ui.checkbox(&mut r, "Reviewed").on_hover_text("r").changed() {
+                actions.push(Action::SetReviewed(index, r));
+            }
+        }
+        if let Some(b) = &sf.browse {
+            ui.label(RichText::new(change.path()).monospace().strong());
+            ui.weak(format!("whole file at {}", b.label));
+            return;
         }
         ui.label(RichText::new(change.status.letter().to_string()).monospace().color(pal.status(change.status)));
         if matches!(change.status, ChangeStatus::Renamed | ChangeStatus::Copied)
