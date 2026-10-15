@@ -101,6 +101,7 @@ impl ReviewApp {
 
     pub fn with_store(cc: &eframe::CreationContext<'_>, store: anyhow::Result<Store>, initial: Option<PathBuf>) -> Self {
         let ctx = cc.egui_ctx.clone();
+        ui::theme::install(&ctx);
         let repaint = ctx.clone();
         let notify: Notify = Arc::new(move || repaint.request_repaint());
         let workers = std::thread::available_parallelism().map_or(2, |n| n.get().clamp(2, 6));
@@ -1153,7 +1154,10 @@ impl ReviewApp {
                 if let Some(rs) = &self.rs {
                     ui.weak(rs.repo.root().display().to_string());
                     if rs.watcher.is_some() {
-                        ui.weak("live").on_hover_text("New commits appear automatically (live refresh)");
+                        let resp = ui.weak("live").on_hover_text("New commits appear automatically (live refresh)");
+                        let dot = egui::pos2(resp.rect.left() - 7.0, resp.rect.center().y);
+                        ui.painter().circle_filled(dot, 3.5, ui::palette(ui).status(review_core::git::ChangeStatus::Added));
+                        ui.add_space(8.0);
                     }
                 }
             });
@@ -1161,23 +1165,37 @@ impl ReviewApp {
     }
 
     fn welcome(&mut self, ui: &mut Ui, actions: &mut Vec<Action>) {
+        let chrome = ui::theme::chrome(ui);
+        let width = ui.available_width().min(440.0);
         ui.vertical_centered(|ui| {
-            ui.add_space(ui.available_height() / 4.0);
-            ui.heading("Simple Review");
-            ui.label("Review code changes commit by commit.");
-            ui.add_space(12.0);
-            if ui.button(RichText::new("Open repository…").size(16.0)).clicked() {
-                actions.push(Action::OpenDialog);
+            ui.add_space((ui.available_height() / 5.0).max(16.0));
+            if let Some(logo) = logo(ui.ctx()) {
+                ui.add(egui::Image::new(&logo).fit_to_exact_size(egui::vec2(72.0, 72.0)));
             }
-            if !self.recent.is_empty() {
-                ui.add_space(16.0);
-                ui.weak("Recent");
-                for path in &self.recent {
-                    if ui.link(path.display().to_string()).clicked() {
-                        actions.push(Action::OpenRepo(path.clone()));
+            ui.add_space(8.0);
+            ui.label(RichText::new("Simple Review").font(ui::theme::bold(24.0)));
+            ui.label(RichText::new("Review code changes commit by commit.").color(chrome.muted));
+            ui.add_space(20.0);
+            ui.allocate_ui_with_layout(egui::vec2(width, 0.0), egui::Layout::top_down(egui::Align::Min), |ui| {
+                ui.set_width(width);
+                let open_tint = chrome.accent;
+                if ui::theme::card(ui, ui::theme::Glyph::Folder, open_tint, "Open repository…", "Pick a folder with a Git repository (Cmd/Ctrl+O)").clicked() {
+                    actions.push(Action::OpenDialog);
+                }
+                if !self.recent.is_empty() {
+                    ui.add_space(12.0);
+                    ui::theme::section(ui, "Recent");
+                    ui.add_space(2.0);
+                    let tint = egui::Color32::from_rgb(0x8e, 0x8e, 0x93);
+                    for path in &self.recent {
+                        let name = path.file_name().map_or_else(|| path.display().to_string(), |n| n.to_string_lossy().into_owned());
+                        let parent = path.parent().map(|p| p.display().to_string()).unwrap_or_default();
+                        if ui::theme::card(ui, ui::theme::Glyph::Branch, tint, &name, &parent).clicked() {
+                            actions.push(Action::OpenRepo(path.clone()));
+                        }
                     }
                 }
-            }
+            });
         });
     }
 
@@ -1375,6 +1393,19 @@ impl ReviewApp {
     }
 }
 
+/// The app icon as a texture, decoded once.
+fn logo(ctx: &egui::Context) -> Option<egui::TextureHandle> {
+    let id = egui::Id::new("app_logo");
+    if let Some(t) = ctx.data(|d| d.get_temp::<egui::TextureHandle>(id)) {
+        return Some(t);
+    }
+    let icon = eframe::icon_data::from_png_bytes(include_bytes!("../icons/128x128.png")).ok()?;
+    let image = egui::ColorImage::from_rgba_unmultiplied([icon.width as usize, icon.height as usize], &icon.rgba);
+    let texture = ctx.load_texture("app_logo", image, egui::TextureOptions::LINEAR);
+    ctx.data_mut(|d| d.insert_temp(id, texture.clone()));
+    Some(texture)
+}
+
 fn placeholder_text(p: &Placeholder) -> (String, Option<&'static str>) {
     let sizes = |old: &Option<u64>, new: &Option<u64>| match (old, new) {
         (Some(o), Some(n)) => format!("{} -> {}", human_size(*o), human_size(*n)),
@@ -1467,25 +1498,33 @@ impl eframe::App for ReviewApp {
             }),
         };
         let (tab_labels, active_tab) = self.tab_labels();
+        let chrome = ui::theme::chrome(ui);
         if self.rs.is_some() || tab_labels.len() > 1 {
-            egui::Panel::top("tab_strip").show(ui, |ui| ui::header::tab_strip(ui, &tab_labels, active_tab, &mut actions));
+            egui::Panel::top("tab_strip")
+                .frame(egui::Frame::new().fill(chrome.sidebar).inner_margin(egui::Margin { left: 8, right: 8, top: 3, bottom: 3 }))
+                .show(ui, |ui| ui::header::tab_strip(ui, &tab_labels, active_tab, &mut actions));
         }
-        egui::Panel::top("toolbar").show(ui, |ui| {
-            ui.add_space(3.0);
-            ui::header::toolbar(ui, &toolbar, &mut actions);
-            ui.add_space(1.0);
-        });
-        egui::Panel::bottom("status").show(ui, |ui| self.status_bar(ui));
+        egui::Panel::top("toolbar")
+            .frame(egui::Frame::new().fill(chrome.content).inner_margin(egui::Margin { left: 10, right: 10, top: 5, bottom: 5 }))
+            .show(ui, |ui| ui::header::toolbar(ui, &toolbar, &mut actions));
+        egui::Panel::bottom("status")
+            .frame(egui::Frame::new().fill(chrome.sidebar).inner_margin(egui::Margin::symmetric(12, 4)))
+            .show(ui, |ui| self.status_bar(ui));
 
         let show_all = self.show_all_files;
         let bisect = self.bisect_marks();
         if let Some(rs) = self.rs.as_mut() {
-            egui::Panel::left("sidebar").default_size(400.0).min_size(260.0).show(ui, |ui| {
+            egui::Panel::left("sidebar")
+                .default_size(400.0)
+                .min_size(260.0)
+                .frame(egui::Frame::new().fill(chrome.sidebar).inner_margin(egui::Margin { left: 8, right: 8, top: 6, bottom: 0 }))
+                .show(ui, |ui| {
                 if let Some(sc) = rs.commit.as_mut() {
                     let settings = &rs.settings;
                     let files = egui::Panel::bottom("files_panel")
+                        .frame(egui::Frame::new().inner_margin(egui::Margin { left: 0, right: 0, top: 8, bottom: 6 }))
                         .resizable(true)
-                        .default_size(ui.available_height() * 0.45)
+                        .default_size(ui.available_height() * 0.4)
                         .min_size(120.0)
                         .show(ui, |ui| {
                             // Fill the panel: egui keeps the laid-out size, so a short list (or the
@@ -1500,7 +1539,9 @@ impl eframe::App for ReviewApp {
                 ui::commits::show(ui, rs, &marks, &mut actions);
             });
         }
-        egui::CentralPanel::default().show(ui, |ui| self.central(ui, &mut actions));
+        egui::CentralPanel::default()
+            .frame(egui::Frame::new().fill(chrome.content).inner_margin(egui::Margin { left: 14, right: 8, top: 10, bottom: 4 }))
+            .show(ui, |ui| self.central(ui, &mut actions));
         ui::help::show(&ctx, &mut self.show_help);
         if let Some(editor) = self.comment_editor.as_mut() {
             ui::dialogs::comment_editor(&ctx, editor, &mut actions);

@@ -13,6 +13,7 @@ pub mod laravel;
 pub mod markdown;
 pub mod peek;
 pub mod quality;
+pub mod theme;
 
 use std::path::PathBuf;
 
@@ -157,11 +158,11 @@ impl Palette {
                 filler: Color32::from_rgb(0x24, 0x26, 0x2b),
                 text: Color32::from_rgb(0xd4, 0xd7, 0xdd),
                 weak: Color32::from_rgb(0x7d, 0x84, 0x90),
-                accent: Color32::from_rgb(0x4d, 0x9d, 0xff),
+                accent: Color32::from_rgb(0x0a, 0x84, 0xff),
                 ai: Color32::from_rgb(0xb3, 0x88, 0xff),
                 warn: Color32::from_rgb(0xe5, 0xa5, 0x3c),
-                cursor_line: Color32::from_rgba_unmultiplied(0x4d, 0x9d, 0xff, 28),
-                selection: Color32::from_rgba_unmultiplied(0x4d, 0x9d, 0xff, 60),
+                cursor_line: Color32::from_rgba_unmultiplied(0x0a, 0x84, 0xff, 28),
+                selection: Color32::from_rgba_unmultiplied(0x0a, 0x84, 0xff, 60),
                 dark,
             }
         } else {
@@ -174,11 +175,11 @@ impl Palette {
                 filler: Color32::from_rgb(0xf3, 0xf4, 0xf6),
                 text: Color32::from_rgb(0x1f, 0x23, 0x28),
                 weak: Color32::from_rgb(0x6e, 0x77, 0x81),
-                accent: Color32::from_rgb(0x09, 0x69, 0xda),
+                accent: Color32::from_rgb(0x00, 0x7a, 0xff),
                 ai: Color32::from_rgb(0x82, 0x50, 0xdf),
                 warn: Color32::from_rgb(0x9a, 0x67, 0x00),
-                cursor_line: Color32::from_rgba_unmultiplied(0x09, 0x69, 0xda, 22),
-                selection: Color32::from_rgba_unmultiplied(0x09, 0x69, 0xda, 50),
+                cursor_line: Color32::from_rgba_unmultiplied(0x00, 0x7a, 0xff, 22),
+                selection: Color32::from_rgba_unmultiplied(0x00, 0x7a, 0xff, 50),
                 dark,
             }
         }

@@ -1,11 +1,11 @@
 //! Files changed in the selected commit, or every file at it ("All files").
 
-use egui::{Align2, FontId, Sense, TextStyle, Ui, pos2, vec2};
+use egui::{Align2, FontId, RichText, Sense, TextStyle, Ui, pos2, vec2};
 use review_core::diff::content::is_generated;
 use review_core::git::ChangeStatus;
 use review_core::settings::RepoSettings;
 
-use super::{Action, palette};
+use super::{Action, palette, theme};
 use crate::state::{FilesState, SelectedCommit};
 
 const ROW_H: f32 = 24.0;
@@ -18,14 +18,11 @@ pub fn show(
     filter: &mut String,
     actions: &mut Vec<Action>,
 ) {
-    ui.horizontal(|ui| {
-        if ui.selectable_label(!show_all, "Changed").on_hover_text("Files changed in this commit (t)").clicked() && show_all {
-            actions.push(Action::ToggleAllFiles);
-        }
-        if ui.selectable_label(show_all, "All files").on_hover_text("Every file at this commit (t)").clicked() && !show_all {
-            actions.push(Action::ToggleAllFiles);
-        }
-    });
+    let views = [(false, "Changed", "Files changed in this commit (t)"), (true, "All files", "Every file at this commit (t)")];
+    if theme::segmented(ui, show_all, &views, true).is_some_and(|v| v != show_all) {
+        actions.push(Action::ToggleAllFiles);
+    }
+    ui.add_space(2.0);
     if show_all {
         all_files(ui, sc, filter, actions);
     } else {
@@ -48,15 +45,14 @@ fn all_files(ui: &mut Ui, sc: &SelectedCommit, filter: &mut String, actions: &mu
         }
         Some(Ok(files)) => files,
     };
-    ui.add(egui::TextEdit::singleline(filter).hint_text("Filter paths…").desired_width(f32::INFINITY));
+    theme::search_field(ui, filter, "Filter paths");
     let needle = filter.to_lowercase();
     let shown: Vec<&str> = files
         .iter()
         .map(|f| f.path.as_str())
         .filter(|p| needle.is_empty() || p.to_lowercase().contains(&needle))
         .collect();
-    ui.weak(format!("{} of {} files at {}", shown.len(), files.len(), sc.info.short_id()));
-    ui.separator();
+    ui.label(RichText::new(format!("{} of {} files at {}", shown.len(), files.len(), sc.info.short_id())).small().color(theme::chrome(ui).muted));
 
     let pal = palette(ui);
     let body = TextStyle::Body.resolve(ui.style());
@@ -66,18 +62,13 @@ fn all_files(ui: &mut Ui, sc: &SelectedCommit, filter: &mut String, actions: &mu
         for path in &shown[range] {
             let (rect, response) = ui.allocate_exact_size(vec2(ui.available_width(), ROW_H), Sense::click());
             let selected = open == Some(*path);
-            if selected {
-                ui.painter().rect_filled(rect, 3.0, ui.visuals().selection.bg_fill);
-            } else if response.hovered() {
-                ui.painter().rect_filled(rect, 3.0, ui.visuals().widgets.hovered.weak_bg_fill);
-            }
+            theme::row_highlight(ui, rect, selected, response.hovered());
             let painter = ui.painter_at(rect);
             let y = rect.center().y;
             if changed.contains(path) {
                 painter.text(pos2(rect.min.x + 4.0, y), Align2::LEFT_CENTER, "M", FontId::monospace(body.size - 1.0), pal.warn);
             }
-            let colour = if selected { ui.visuals().selection.stroke.color } else { pal.text };
-            painter.text(pos2(rect.min.x + 22.0, y), Align2::LEFT_CENTER, *path, body.clone(), colour);
+            painter.text(pos2(rect.min.x + 22.0, y), Align2::LEFT_CENTER, *path, body.clone(), pal.text);
             if response.clicked() {
                 actions.push(Action::OpenTreeFile(path.to_string()));
             }
@@ -101,12 +92,16 @@ fn changed_files(ui: &mut Ui, sc: &mut SelectedCommit, settings: &RepoSettings, 
         FilesState::Ready(files) => files,
     };
 
+    let reviewed = files.iter().filter(|f| sc.reviewed.contains(f.path())).count();
     ui.horizontal(|ui| {
-        ui.strong("Files");
-        let reviewed = files.iter().filter(|f| sc.reviewed.contains(f.path())).count();
-        ui.weak(format!("{} changed · {reviewed}/{} reviewed", files.len(), files.len()));
+        theme::section(ui, "Files");
+        ui.label(RichText::new(format!("{} changed", files.len())).small().color(theme::chrome(ui).muted));
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ui.label(RichText::new(format!("{reviewed}/{}", files.len())).small().color(theme::chrome(ui).muted));
+            let progress = if files.is_empty() { 0.0 } else { reviewed as f32 / files.len() as f32 };
+            progress_bar(ui, progress);
+        });
     });
-    ui.separator();
     if files.is_empty() {
         ui.weak("No changes against this parent.");
         return;
@@ -134,11 +129,7 @@ fn changed_files(ui: &mut Ui, sc: &mut SelectedCommit, settings: &RepoSettings, 
                     actions.push(Action::SetReviewed(i, reviewed));
                 }
                 let (rect, response) = ui.allocate_exact_size(vec2(ui.available_width(), ROW_H), Sense::click());
-                if selected == Some(i) {
-                    ui.painter().rect_filled(rect, 3.0, ui.visuals().selection.bg_fill);
-                } else if response.hovered() {
-                    ui.painter().rect_filled(rect, 3.0, ui.visuals().widgets.hovered.weak_bg_fill);
-                }
+                theme::row_highlight(ui, rect, selected == Some(i), response.hovered());
                 let painter = ui.painter_at(rect);
                 let colour = pal.status(f.status);
                 let y = rect.center().y;
@@ -149,9 +140,10 @@ fn changed_files(ui: &mut Ui, sc: &mut SelectedCommit, settings: &RepoSettings, 
                     Some((d, n)) => (format!("{d}/"), n),
                     None => (String::new(), path),
                 };
-                let name_colour = if collapsed { pal.weak } else if selected == Some(i) { ui.visuals().selection.stroke.color } else { pal.text };
+                let name_colour = if collapsed { pal.weak } else { pal.text };
                 let mut x = rect.min.x + 22.0;
-                x += painter.text(pos2(x, y), Align2::LEFT_CENTER, name, body.clone(), name_colour).width() + 6.0;
+                let name_font = if selected == Some(i) { super::theme::bold(body.size) } else { body.clone() };
+                x += painter.text(pos2(x, y), Align2::LEFT_CENTER, name, name_font, name_colour).width() + 6.0;
                 painter.text(pos2(x, y), Align2::LEFT_CENTER, &dir, FontId::proportional(body.size - 2.0), pal.weak);
 
                 if response.clicked() {
@@ -171,4 +163,17 @@ fn changed_files(ui: &mut Ui, sc: &mut SelectedCommit, settings: &RepoSettings, 
             });
         }
     });
+}
+
+/// A thin rounded bar, filled with the accent up to `progress` (0–1).
+fn progress_bar(ui: &mut Ui, progress: f32) {
+    let c = theme::chrome(ui);
+    let (rect, _) = ui.allocate_exact_size(vec2(60.0, 5.0), Sense::hover());
+    ui.painter().rect_filled(rect, 3.0, c.well);
+    let mut done = rect;
+    done.set_width(rect.width() * progress.clamp(0.0, 1.0));
+    if progress > 0.0 {
+        let colour = if progress >= 1.0 { palette(ui).status(ChangeStatus::Added) } else { c.accent };
+        ui.painter().rect_filled(done, 3.0, colour);
+    }
 }

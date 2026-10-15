@@ -8,7 +8,7 @@ use std::collections::{HashMap, HashSet};
 use review_core::ObjectId;
 use review_core::laravel::risk::Risk;
 
-use super::{Action, palette};
+use super::{Action, palette, theme};
 use crate::state::RepoState;
 
 const ROW_H: f32 = 40.0;
@@ -25,27 +25,26 @@ pub struct Marks<'a> {
 
 pub fn show(ui: &mut Ui, rs: &mut RepoState, marks: &Marks<'_>, actions: &mut Vec<Action>) {
     ui.horizontal(|ui| {
-        ui.strong("Commits");
+        theme::section(ui, "Commits");
         let loaded = if rs.pager_done { format!("{}", rs.commits.len()) } else { format!("{}+", rs.commits.len()) };
-        ui.weak(loaded);
+        ui.label(RichText::new(loaded).small().color(theme::chrome(ui).muted));
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            let mut ai = rs.ai_only;
-            if ui.toggle_value(&mut ai, "AI only").on_hover_text("Show only AI-assisted commits (a)").changed() {
+            if theme::toggle_pill(ui, rs.ai_only, "AI only").on_hover_text("Show only AI-assisted commits (a)").clicked() {
                 actions.push(Action::ToggleAiOnly);
             }
         });
     });
-    ui.separator();
+    ui.add_space(2.0);
     if let Some(range) = &rs.range {
         let whole = rs.commit.as_ref().is_some_and(|c| c.base.is_some());
-        if ui
-            .selectable_label(whole, RichText::new(format!("▶ Whole range {}", range.label)).strong())
-            .on_hover_text("Review all changes in the range at once")
-            .clicked()
-        {
+        let (rect, response) = ui.allocate_exact_size(vec2(ui.available_width(), 28.0), Sense::click());
+        theme::row_highlight(ui, rect, whole, response.hovered());
+        let accent = theme::chrome(ui).accent;
+        ui.painter().text(pos2(rect.min.x + 8.0, rect.center().y), Align2::LEFT_CENTER, format!("▶  Whole range {}", range.label), theme::bold(13.0), accent);
+        if response.on_hover_text("Review all changes in the range at once").clicked() {
             actions.push(Action::SelectWholeRange);
         }
-        ui.separator();
+        ui.add_space(2.0);
     }
 
     let pal = palette(ui);
@@ -73,25 +72,21 @@ pub fn show(ui: &mut Ui, rs: &mut RepoState, marks: &Marks<'_>, actions: &mut Ve
             let c = &rs.commits[idx];
             let (rect, response) = ui.allocate_exact_size(vec2(ui.available_width(), ROW_H), Sense::click());
             let is_selected = selected == Some(c.id) && rs.commit.as_ref().is_some_and(|sc| sc.base.is_none());
+            theme::row_highlight(ui, rect.shrink2(vec2(0.0, 1.0)), is_selected, response.hovered());
             if is_selected {
-                ui.painter().rect_filled(rect, 3.0, ui.visuals().selection.bg_fill);
-            } else if response.hovered() {
-                ui.painter().rect_filled(rect, 3.0, ui.visuals().widgets.hovered.weak_bg_fill);
+                let bar = Rect::from_min_size(pos2(rect.min.x + 2.0, rect.min.y + 9.0), vec2(3.0, ROW_H - 18.0));
+                ui.painter().rect_filled(bar, 2.0, pal.accent);
             }
             let painter = ui.painter_at(rect.shrink(2.0));
-            let text_colour = if is_selected { ui.visuals().selection.stroke.color } else { pal.text };
-            let x = rect.min.x + 6.0;
+            let text_colour = pal.text;
+            let x = rect.min.x + 10.0;
             let line1 = rect.min.y + 11.0;
             let line2 = rect.min.y + 29.0;
 
             // Badges on the right of the first line, so the summary is clipped before them.
-            let mut right = rect.max.x - 6.0;
+            let mut right = rect.max.x - 8.0;
             let mut badge = |label: &str, colour: egui::Color32| {
-                let galley = painter.layout_no_wrap(label.to_string(), small.clone(), colour);
-                let r = Rect::from_min_size(pos2(right - galley.size().x - 8.0, line1 - 8.0), vec2(galley.size().x + 8.0, 16.0));
-                painter.rect_stroke(r, 4.0, (1.0, colour), egui::StrokeKind::Inside);
-                painter.galley(pos2(r.min.x + 4.0, r.center().y - galley.size().y / 2.0), galley, colour);
-                right = r.min.x - 4.0;
+                right = theme::paint_tag(&painter, right, line1, label, colour) - 4.0;
             };
             if marks.bad == Some(c.id) {
                 badge("bad", pal.status(review_core::git::ChangeStatus::Deleted));
@@ -116,7 +111,7 @@ pub fn show(ui: &mut Ui, rs: &mut RepoState, marks: &Marks<'_>, actions: &mut Ve
                 pos2(x + hash_w + 8.0, line1),
                 Align2::LEFT_CENTER,
                 &c.summary,
-                body.clone(),
+                if is_selected { theme::bold(body.size) } else { body.clone() },
                 text_colour,
             );
             let mut meta = format!("{}  ·  {}", c.author.name, format_time(&c.author));

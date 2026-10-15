@@ -73,8 +73,8 @@ fn browse_commits_and_navigate_diffs() {
     // Selecting commits doesn't resize the file list, even while it shows the loading spinner
     // or a commit with fewer files.
     let files_height = harness.state().files_panel_rect.height();
-    // About 45% of the sidebar, not collapsed to the 120-point minimum by the loading spinner.
-    assert!(files_height > 300.0, "file list collapsed to {files_height}");
+    // About 40% of the sidebar, not collapsed to the 120-point minimum by the loading spinner.
+    assert!(files_height > 250.0, "file list collapsed to {files_height}");
     for summary in ["Initial Laravel skeleton", "Remove legacy helper", "Convert routes to CRLF"] {
         select_summary(&mut harness, summary);
         harness.run_steps(1);
@@ -761,3 +761,31 @@ fn share_and_import_threads() {
     assert_eq!(harness.state().rs.as_ref().unwrap().threads[0].comments.len(), 2);
 }
 
+
+
+#[test]
+fn tab_close_button_and_switch_by_click() {
+    use egui_kittest::kittest::Queryable;
+    let tmp = tempfile::tempdir().unwrap();
+    let a = fixture::build(&tmp.path().join("shop")).unwrap();
+    let b = fixture::build(&tmp.path().join("other")).unwrap();
+    let pa = a.path.clone();
+    let mut harness = Harness::builder()
+        .with_size(egui::vec2(1400.0, 900.0))
+        .wgpu()
+        .build_eframe(move |cc| ReviewApp::with_store(cc, Store::in_memory(), Some(pa)));
+    wait_until(&mut harness, "first repo", view_ready);
+    harness.state_mut().apply(Action::OpenRepo(b.path.clone()));
+    wait_until(&mut harness, "second repo", view_ready);
+    assert_eq!(harness.state().tab_labels(), (vec!["shop".to_string(), "other".to_string()], 1));
+
+    // Clicking a tab's label switches to it.
+    harness.get_by_label("shop").click();
+    harness.run_steps(2);
+    assert_eq!(harness.state().tab_labels().1, 0);
+
+    // The × in a tab closes that tab, not just selects it.
+    harness.get_all_by_label("×").nth(1).expect("close button of the second tab").click();
+    harness.run_steps(2);
+    assert_eq!(harness.state().tab_labels(), (vec!["shop".to_string()], 0));
+}

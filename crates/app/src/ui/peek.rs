@@ -30,8 +30,9 @@ pub fn show(
     bookmarks: Option<(&[review_core::review::bookmarks::Bookmark], &mut Vec<String>)>,
     actions: &mut Vec<Action>,
 ) {
+    ui.add_space(4.0);
     ui.horizontal(|ui| {
-        for (tab, label, hint) in [
+        let tabs = [
             (PeekTab::Definition, "Definition", "F12 / Cmd+click"),
             (PeekTab::References, "References", "Shift+F12"),
             (PeekTab::Blame, "Blame", "Line history for the cursor line"),
@@ -40,13 +41,12 @@ pub fn show(
             (PeekTab::History, "History", "When did text appear? History of lines (h)"),
             (PeekTab::Laravel, "Laravel", "Schema, packages and routes for this commit (l)"),
             (PeekTab::Bookmarks, "Bookmarks", "Saved places (Cmd/Ctrl+D to add)"),
-        ] {
-            if ui.selectable_label(peek.tab == tab, label).on_hover_text(hint).clicked() {
-                actions.push(Action::PeekTab(tab));
-            }
+        ];
+        if let Some(tab) = super::theme::segmented(ui, peek.tab, &tabs, false) {
+            actions.push(Action::PeekTab(tab));
         }
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if ui.small_button("×").on_hover_text("Close (Esc)").clicked() {
+            if super::theme::pill(ui, "×").on_hover_text("Close (Esc)").clicked() {
                 actions.push(Action::ClosePeek);
             }
         });

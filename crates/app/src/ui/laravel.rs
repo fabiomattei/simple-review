@@ -16,13 +16,10 @@ pub struct LaravelView<'a> {
 }
 
 pub fn show(ui: &mut Ui, tab: LaravelTab, filter: &mut String, v: &LaravelView<'_>, actions: &mut Vec<Action>) {
-    ui.horizontal(|ui| {
-        for (t, label) in [(LaravelTab::Schema, "Schema"), (LaravelTab::Packages, "Packages"), (LaravelTab::Routes, "Routes")] {
-            if ui.selectable_label(tab == t, label).clicked() {
-                actions.push(Action::LaravelTab(t));
-            }
-        }
-    });
+    let tabs = [(LaravelTab::Schema, "Schema", ""), (LaravelTab::Packages, "Packages", ""), (LaravelTab::Routes, "Routes", "")];
+    if let Some(t) = super::theme::segmented(ui, tab, &tabs, false) {
+        actions.push(Action::LaravelTab(t));
+    }
     ui.separator();
     let data = match v.data {
         None | Some(Err(None)) => {

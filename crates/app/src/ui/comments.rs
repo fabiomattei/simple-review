@@ -26,18 +26,14 @@ pub struct CommentsView {
 pub fn show(ui: &mut Ui, v: &CommentsView, actions: &mut Vec<Action>) {
     let pal = palette(ui);
     ui.horizontal(|ui| {
-        for (scope, label) in [(CommentScope::File, "This file"), (CommentScope::Commit, "This review"), (CommentScope::All, "Repository")] {
-            if ui.selectable_label(v.scope == scope, label).clicked() {
-                actions.push(Action::CommentScope(scope));
-            }
+        let scopes = [(CommentScope::File, "This file", ""), (CommentScope::Commit, "This review", ""), (CommentScope::All, "Repository", "")];
+        if let Some(scope) = super::theme::segmented(ui, v.scope, &scopes, false) {
+            actions.push(Action::CommentScope(scope));
         }
-        ui.separator();
-        for (status, label) in [(StatusFilter::Open, "Open"), (StatusFilter::Closed, "Closed"), (StatusFilter::All, "All")] {
-            if ui.selectable_label(v.status == status, label).clicked() {
-                actions.push(Action::CommentStatusFilter(status));
-            }
+        let statuses = [(StatusFilter::Open, "Open", ""), (StatusFilter::Closed, "Closed", ""), (StatusFilter::All, "All", "")];
+        if let Some(status) = super::theme::segmented(ui, v.status, &statuses, false) {
+            actions.push(Action::CommentStatusFilter(status));
         }
-        ui.separator();
         let label = match &v.target {
             Some(t) => format!("Comment on {t} (c)"),
             None => "Comment (c)".to_string(),
